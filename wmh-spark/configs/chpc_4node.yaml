@@ -1,0 +1,77 @@
+# CHPC 4-worker Spark configuration.
+# Driver: 16 GB RAM (right-sized; we don't collect huge results)
+# Workers: 4 nodes, 32 GB RAM each, 4 cores each
+#
+# Submit via: sbatch scripts/slurm/spark_4node.sbatch
+seed: 42
+
+spark:
+  app_name: wmh-spark-chpc-4
+  master: "spark://${SPARK_MASTER_HOST}:7077"   # set by sbatch wrapper
+  driver_memory: "16g"
+  executor_memory: "28g"      # leave 4 GB headroom for OS + Python
+  executor_cores: 4
+  num_executors: 4
+  arrow_max_records_per_batch: 4000
+  python_exec: python3
+  extra_conf:
+    spark.local.dir: /scratch/local/spark-tmp
+    spark.network.timeout: "600s"
+    spark.executor.heartbeatInterval: "60s"
+
+stripping:
+  method: synthstrip
+  container_path: /uufs/chpc.utah.edu/common/home/u1592037/sif/synthstrip.sif
+  gpu: false
+
+registration:
+  template_path: /uufs/chpc.utah.edu/common/home/u1592037/templates/MNI152_T1_1mm_brain.nii.gz
+  transform_type: Affine
+  cache_warps: true
+
+features:
+  use_flair_zscore: true
+  use_t1_intensity: true
+  use_flair_t1_ratio: true
+  use_distance_to_ventricle: true
+  use_mni_coords: true
+  use_neighborhood_stats: true
+  neighborhood_radius: 1
+  wm_mask_threshold: 0.5
+  flair_min_threshold: 0.7
+
+sampling:
+  negative_to_positive_ratio: 5
+  max_voxels_per_subject: 200000     # bigger budget on cluster
+  train_fraction: 0.7
+  val_fraction: 0.15
+  test_fraction: 0.15
+
+model:
+  name: rf
+  knn_k: 5
+  rf_num_trees: 200
+  rf_max_depth: 14
+  rf_min_instances_per_node: 100
+  rf_subsampling_rate: 0.7
+  xgb_max_depth: 8
+  xgb_learning_rate: 0.1
+  xgb_n_estimators: 300
+
+evaluation:
+  primary_reference: expert
+  decision_threshold: 0.5
+  compute_dice: true
+  compute_lesion_f1: true
+  compute_hausdorff: true
+  compute_volume_difference: true
+  lesion_overlap_threshold: 0.0
+
+paths:
+  data_dir: /scratch/general/u1592037/wmh/data
+  manifest_path: /scratch/general/u1592037/wmh/manifest.parquet
+  work_dir: /scratch/general/u1592037/wmh/work
+  output_dir: /scratch/general/u1592037/wmh/output
+  model_dir: /scratch/general/u1592037/wmh/output/models
+  metrics_dir: /scratch/general/u1592037/wmh/output/metrics
+  log_dir: /scratch/general/u1592037/wmh/logs
