@@ -1,0 +1,19 @@
+spark:
+  app_name: wmh-spark-local
+  master: "local[4]"
+  driver_memory: 8g
+  executor_memory: 4g
+  executor_cores: 2
+  num_executors: 2
+
+ingestion:
+  partition_count: 0   # 0 = auto-derive from voxel count and 16GB/worker ceiling
+
+paths:
+  data_dir: datasets/
+  manifest_path: data/manifest.parquet
+  work_dir: data/work
+  output_dir: data/output
+  model_dir: data/output/models
+  metrics_dir: data/output/metrics
+  log_dir: wmh-spark/data/logs

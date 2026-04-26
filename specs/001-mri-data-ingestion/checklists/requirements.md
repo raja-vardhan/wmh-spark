@@ -31,6 +31,9 @@
 
 ## Notes
 
-- All checklist items pass — spec is ready for `/speckit-plan`.
+- All checklist items pass after remediation edits applied 2026-04-25.
 - Mask validation (FR-004, FR-005, US2) cannot be exercised until Kaggle data is available
   (Phase 2). SC-002 is deferred to Phase 2 validation runs.
+- T032 documents the Phase 2 architectural requirement to replace driver-side pandas
+  materialization with worker-side nibabel reads (Constitution Principle III at CHPC scale).
+- T030/T031 close the FR-009/SC-005 coverage gaps identified in the `/speckit-analyze` report.

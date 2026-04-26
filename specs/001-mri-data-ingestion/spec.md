@@ -109,7 +109,7 @@ per-worker memory budget derived from voxel count and bytes-per-row.
 - What happens when a subject has additional scan types beyond T1 and FLAIR (e.g., T2)?
   The ingestion module loads only T1 and FLAIR; additional files are ignored without error.
 - What happens when NIfTI files use different affine transforms (different spatial registration)?
-  The pipeline detects affine mismatch and raises a registration error; unregistered scans are
+  The pipeline detects affine mismatch and raises a `ValueError`; unregistered scans are
   not ingested.
 
 ## Requirements *(mandatory)*
@@ -127,7 +127,9 @@ per-worker memory budget derived from voxel count and bytes-per-row.
 - **FR-005**: The system MUST validate that any ingested mask is strictly binary (only values 0
   and 1); non-binary masks MUST cause a validation error and halt ingestion.
 - **FR-006**: The system MUST partition the output DataFrame using an explicit, configurable
-  partition count to prevent driver-node bottlenecks.
+  partition count to prevent driver-node bottlenecks. When no explicit count is configured
+  (value = 0), the system MUST auto-derive a safe partition count from the voxel volume size
+  and a per-worker memory ceiling of 16 GB.
 - **FR-007**: The system MUST log the resolved partition count and voxel count for every
   ingestion run to support benchmarking and debugging.
 - **FR-008**: The system MUST fail fast with descriptive error messages when required input
@@ -169,8 +171,8 @@ per-worker memory budget derived from voxel count and bytes-per-row.
   masks; mask ingestion will be validated once Kaggle data is available in Phase 2.
 - Subject directory structure follows a flat layout: all NIfTI files for a subject reside
   directly in the subject folder (no nested subdirectories required).
-- The pipeline runs in a Python 3.9 / PySpark 3.5 environment; no additional NIfTI parsing
-  libraries beyond nibabel are assumed to be unavailable.
+- The pipeline runs in a Python 3.9 / PySpark 3.5 environment; nibabel is the assumed NIfTI
+  parsing library — no other NIfTI-specific libraries are assumed to be available.
 - The ingestion module does not perform skull-stripping or pre-processing; it loads raw NIfTI
   arrays as-is and delegates stripping to the downstream containerized HD-BET step.
 - Mobile or web interfaces are out of scope; all invocation is via Python API or CLI.
