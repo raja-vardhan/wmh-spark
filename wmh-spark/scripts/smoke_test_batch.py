@@ -6,11 +6,16 @@ Run from repo root:
 
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 from pathlib import Path
 
 import numpy as np
+
+# Keep PySpark workers on the same Python minor version as the driver.
+os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
+os.environ.setdefault("PYSPARK_DRIVER_PYTHON", sys.executable)
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "wmh-spark" / "src"))
