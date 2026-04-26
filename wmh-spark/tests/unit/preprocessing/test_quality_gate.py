@@ -214,7 +214,7 @@ class TestPairAtomicRejection:
         quarantine = out_dir / "quarantine" / "sub-gate"
         assert quarantine.exists()
 
-    def test_docker_error_returns_error_status(self, tmp_path):
+    def test_hdbet_error_returns_error_status(self, tmp_path):
         from wmh_spark.preprocessing.skull_strip import RawScan, ScanPair, SkullStripper
 
         t1_src = tmp_path / "T1.nii.gz"
@@ -229,9 +229,9 @@ class TestPairAtomicRejection:
         )
 
         stripper = SkullStripper(output_dir=tmp_path / "out", smoke_test=True)
-        from wmh_spark.preprocessing.skull_strip import DockerExecutionError
+        from wmh_spark.preprocessing.skull_strip import HDBETExecutionError
         with patch.object(stripper._runner, "run",
-                          side_effect=DockerExecutionError("GPU unavailable")):
+                          side_effect=HDBETExecutionError("HD-BET unavailable")):
             result = stripper.process_pair(pair)
 
         assert result.status == "error"

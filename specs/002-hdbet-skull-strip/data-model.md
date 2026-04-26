@@ -52,7 +52,7 @@ ScanPair  →  (HD-BET runs)  →  SkullStrippedOutput(status="accepted"|"reject
 ```
 - `accepted`: Both T1 and FLAIR pass quality gate; forwarded to downstream ingestion.
 - `rejected`: One or both scans fail DSC gate (Phase 2) or structural assertions (Phase 1).
-- `error`: Docker execution failed or output file is unreadable.
+- `error`: Local HD-BET execution failed or output file is unreadable.
 
 ---
 
@@ -84,7 +84,7 @@ Input directory / manifest
 [ScanPair discovery]
         │  discovers T1 + FLAIR paths per subject
         ▼
-[Docker HD-BET execution]
+[Local HD-BET execution]
         │  produces skull-stripped NIfTI + binary mask per scan
         ▼
 [Quality gate]

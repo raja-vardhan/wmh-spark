@@ -12,7 +12,9 @@
 | `--manifest PATH` | Path | No | Parquet manifest file (alternative to `--input-dir`; uses `SubjectRecord` schema) |
 | `--subject SUBJECT_ID` | str | No | Process a single subject only (single-scan reprocessing mode) |
 | `--smoke-test` | flag | No | Activates Phase 1 mode: skips DSC gate, applies structural assertions only |
-| `--docker-image TAG` | str | No | Override Docker image tag (default: `wmh-spark/hdbet:2.0.0`) |
+| `--hdbet-bin PATH` | str | No | Local HD-BET executable path (default: `hd-bet` next to the current Python interpreter, then `PATH`) |
+| `--device {cpu,cuda,mps}` | str | No | Local HD-BET device (default: `cpu`) |
+| `--enable-tta` | flag | No | Enable HD-BET test-time augmentation (disabled by default) |
 | `--benchmark-out PATH` | Path | No | Override benchmark JSON output path (default: `data/output/metrics/skull_strip_benchmark.json`) |
 
 ## Exit Codes
@@ -21,7 +23,7 @@
 |------|---------|
 | `0` | All scans processed; zero errors |
 | `1` | One or more scans rejected by quality gate (batch partially accepted) |
-| `2` | Fatal error (Docker unavailable, no input found, output directory unwritable) |
+| `2` | Fatal error (HD-BET unavailable, no input found, output directory unwritable) |
 
 ## Output Structure
 
@@ -46,7 +48,7 @@ from wmh_spark.preprocessing.skull_strip import SkullStripper
 
 stripper = SkullStripper(
     output_dir="data/work/skull_stripped",
-    docker_image="wmh-spark/hdbet:2.0.0",
+    device="cpu",
     smoke_test=False,
 )
 

@@ -2,39 +2,32 @@
 
 **Branch**: `002-hdbet-skull-strip` | **Date**: 2026-04-26
 
-## Decision 1: HD-BET Docker Image Strategy
+## Decision 1: Local HD-BET Dependency Strategy
 
-**Decision**: Build a project-owned Docker image (`wmh-spark/hdbet:2.0.0`) from a pinned base, with HD-BET installed via pip at a fixed version.
+**Decision**: Run HD-BET locally through the project Python environment, with `hd-bet==2.0.0`, `torch==2.4.0+cpu`, and `torchvision==0.19.0+cpu` pinned in `requirements.txt`.
 
-**Rationale**: There is no official HD-BET Docker Hub image. HD-BET is pip-installable (`hd-bet==2.0.0`). Building a project-owned image from a pinned PyTorch CUDA base guarantees identical tool behaviour across all CHPC nodes and local dev runs, satisfying Constitution Principle II.
+**Rationale**: The project now runs local HD-BET directly and no longer requires Docker daemon access. Pinning HD-BET and the PyTorch CPU wheel pair keeps smoke-test behavior reproducible while avoiding container startup and Docker socket failures.
 
 **Alternatives considered**:
-- Use a community HD-BET Docker image — rejected: unverified provenance, no guaranteed version pin, may not match CHPC node GPU drivers.
-- Install HD-BET bare-metal on CHPC — rejected: explicitly prohibited by Constitution Principle II.
+- Use a project-owned Docker image — rejected for the current implementation: Docker daemon access is not consistently available in local environments.
+- Use a community HD-BET image — rejected: unverified provenance and no guaranteed version pin.
 
-**Pinned base**: `pytorch/pytorch:2.0.0-cuda11.7-cudnn8-runtime`
-**Image tag**: `wmh-spark/hdbet:2.0.0`
-**Dockerfile location**: `docker/hdbet/Dockerfile`
+**Pinned versions**: `hd-bet==2.0.0`, `torch==2.4.0+cpu`, `torchvision==0.19.0+cpu`
 
 ---
 
-## Decision 2: Docker Execution from Python
+## Decision 2: Local HD-BET Execution from Python
 
-**Decision**: Use Python's `subprocess` module to invoke `docker run` commands.
+**Decision**: Use Python's `subprocess` module to invoke the local `hd-bet` CLI.
 
-**Rationale**: `subprocess` is stdlib, adds no dependencies, and is sufficient for a single-command container invocation. The `docker` Python SDK (docker-py) would add an extra dependency and requires the Docker daemon socket to be accessible via a Python binding — no advantage for this use case.
+**Rationale**: `subprocess` is stdlib, adds no dependencies, and is sufficient for a single-command HD-BET invocation. Keeping the runner local avoids Docker daemon/socket requirements and still lets the module capture stdout/stderr programmatically.
 
 **Command pattern**:
 ```
-docker run --rm --gpus all \
-  -v <input_dir>:/input:ro \
-  -v <output_dir>:/output \
-  wmh-spark/hdbet:2.0.0 \
-  hd_bet -i /input/<scan>.nii.gz -o /output/<scan>_bet.nii.gz
+hd-bet -i <scan>.nii.gz -o <output-base>.nii.gz -device cpu --save_bet_mask --disable_tta
 ```
 
 **Alternatives considered**:
-- docker-py SDK — rejected: extra dependency with no functional advantage for single-command invocation.
 - Shell script wrapper — rejected: harder to test, harder to capture stdout/stderr programmatically.
 
 ---
@@ -81,7 +74,7 @@ where `{stem}` is the input filename without `.nii.gz` or `.nii`.
 **Flow**:
 ```
 Raw NIfTI files
-    ↓  skull_strip.py (Docker HD-BET)
+    ↓  skull_strip.py (local HD-BET)
 Stripped NIfTI files + masks
     ↓  quality_gate.py (DSC or smoke-test assertions)
 Accepted stripped files

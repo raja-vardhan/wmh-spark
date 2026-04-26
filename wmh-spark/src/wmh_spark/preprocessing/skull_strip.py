@@ -1,17 +1,17 @@
 """HD-BET skull-stripping preprocessing module.
 
-Orchestrates Docker-based HD-BET execution on raw T1/FLAIR NIfTI scan pairs,
+Orchestrates local HD-BET execution on raw T1/FLAIR NIfTI scan pairs,
 applies a quality gate, and forwards accepted outputs to the ingestion stage.
 """
 from __future__ import annotations
 
 import dataclasses
-import hashlib
 import json
 import logging
 import re
 import shutil
 import subprocess
+import sys
 import time
 import uuid
 from collections import defaultdict
@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-class DockerExecutionError(RuntimeError):
+class HDBETExecutionError(RuntimeError):
     pass
 
 
@@ -78,38 +78,93 @@ class ProcessingLogEntry:
 
 
 # ---------------------------------------------------------------------------
-# Docker runner  (T011)
+# Local HD-BET runner
 # ---------------------------------------------------------------------------
 
 
-class DockerRunner:
-    def __init__(self, image: str, use_gpu: bool = False) -> None:
-        self.image = image
-        self.use_gpu = use_gpu
+def _default_hdbet_executable() -> str:
+    local_hdbet = Path(sys.executable).with_name("hd-bet")
+    if local_hdbet.exists():
+        return str(local_hdbet)
+    return "hd-bet"
+
+
+class HDBETRunner:
+    def __init__(
+        self,
+        executable: Optional[str] = None,
+        device: str = "cpu",
+        disable_tta: bool = True,
+    ) -> None:
+        self.executable = executable or _default_hdbet_executable()
+        self.device = device
+        self.disable_tta = disable_tta
 
     def _build_command(self, input_path: Path, output_path: Path) -> List[str]:
-        cmd: List[str] = ["docker", "run", "--rm"]
-        if self.use_gpu:
-            cmd.extend(["--gpus", "all"])
-        cmd.extend(
-            [
-                "-v", f"{input_path.parent}:/input:ro",
-                "-v", f"{output_path.parent}:/output",
-                self.image,
-                "-i", f"/input/{input_path.name}",
-                "-o", f"/output/{output_path.name}",
-            ]
-        )
+        temp_image_path, _ = self._temporary_output_paths(output_path)
+        cmd: List[str] = [
+            self.executable,
+            "-i", str(input_path),
+            "-o", str(temp_image_path),
+            "-device", self.device,
+            "--save_bet_mask",
+        ]
+        if self.disable_tta:
+            cmd.append("--disable_tta")
         return cmd
 
     def run(self, input_path: Path, output_path: Path) -> None:
         cmd = self._build_command(input_path, output_path)
-        logger.debug("DockerRunner cmd: %s", " ".join(cmd))
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        logger.debug("HDBETRunner cmd: %s", " ".join(cmd))
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True)
+        except FileNotFoundError as exc:
+            raise HDBETExecutionError(
+                f"HD-BET executable not found: {self.executable}. "
+                "Install hd-bet or pass --hdbet-bin."
+            ) from exc
+
         if result.returncode != 0:
-            raise DockerExecutionError(
-                f"HD-BET failed for {input_path.name}: {result.stderr.strip()}"
+            stderr = result.stderr if isinstance(result.stderr, str) else ""
+            stdout = result.stdout if isinstance(result.stdout, str) else ""
+            detail = "\n".join(
+                part for part in [stderr.strip(), stdout.strip()] if part
             )
+            raise HDBETExecutionError(
+                f"HD-BET failed for {input_path.name} "
+                f"(exit code {result.returncode}): {detail}"
+            )
+
+        self._normalise_outputs(output_path)
+
+    @staticmethod
+    def _temporary_output_paths(output_path: Path) -> tuple[Path, Path]:
+        stem = _derive_stem(output_path)
+        raw_stem = stem[:-4] if stem.endswith("_bet") else stem
+        temp_image_path = output_path.parent / f"{raw_stem}.nii.gz"
+        temp_mask_path = output_path.parent / f"{raw_stem}_bet.nii.gz"
+        return temp_image_path, temp_mask_path
+
+    def _normalise_outputs(self, output_path: Path) -> None:
+        temp_image_path, temp_mask_path = self._temporary_output_paths(output_path)
+        mask_path = output_path.parent / (
+            output_path.name[:-7] + "_mask.nii.gz"
+            if output_path.name.endswith(".nii.gz")
+            else output_path.stem + "_mask.nii.gz"
+        )
+
+        missing = [
+            str(path) for path in (temp_image_path, temp_mask_path)
+            if not path.exists()
+        ]
+        if missing:
+            raise HDBETExecutionError(
+                "HD-BET completed but expected output files were missing: "
+                + ", ".join(missing)
+            )
+
+        temp_mask_path.replace(mask_path)
+        temp_image_path.replace(output_path)
 
 
 # ---------------------------------------------------------------------------
@@ -182,21 +237,23 @@ def _discover_pairs(input_dir: Path) -> List[ScanPair]:
 
 
 class SkullStripper:
-    DEFAULT_IMAGE = "wmh-spark/hdbet:2.0.0"
-
     def __init__(
         self,
         output_dir: Path | str,
-        docker_image: str = DEFAULT_IMAGE,
         smoke_test: bool = False,
         benchmark_out: Optional[Path | str] = None,
-        use_gpu: bool = False,
+        hdbet_bin: Optional[str] = None,
+        device: str = "cpu",
+        disable_tta: bool = True,
     ) -> None:
         self.output_dir = Path(output_dir)
-        self.docker_image = docker_image
         self.smoke_test = smoke_test
         self.benchmark_out = Path(benchmark_out) if benchmark_out else None
-        self._runner = DockerRunner(docker_image, use_gpu=use_gpu)
+        self._runner = HDBETRunner(
+            executable=hdbet_bin,
+            device=device,
+            disable_tta=disable_tta,
+        )
         self._run_id = str(uuid.uuid4())[:8]
 
     def process_pair(self, pair: ScanPair) -> SkullStrippedOutput:
@@ -219,11 +276,11 @@ class SkullStripper:
         flair_out = subject_dir / f"{flair_stem}_bet.nii.gz"
         flair_mask_out = subject_dir / f"{flair_stem}_bet_mask.nii.gz"
 
-        # Docker execution
+        # Local HD-BET execution
         try:
             self._runner.run(pair.t1_scan.path, t1_out)
             self._runner.run(pair.flair_scan.path, flair_out)
-        except DockerExecutionError as exc:
+        except HDBETExecutionError as exc:
             return SkullStrippedOutput(
                 subject_id=pair.subject_id,
                 status="error",
@@ -394,13 +451,24 @@ def _main() -> int:
     parser.add_argument("--subject", type=str, default=None, help="Process single subject only")
     parser.add_argument("--smoke-test", action="store_true", help="Phase 1 mode: skip DSC gate")
     parser.add_argument(
-        "--docker-image", type=str, default=SkullStripper.DEFAULT_IMAGE,
-        help="Docker image tag (default: wmh-spark/hdbet:2.0.0)",
+        "--hdbet-bin",
+        type=str,
+        default=None,
+        help=(
+            "HD-BET executable path (default: hd-bet next to current Python, "
+            "then PATH)"
+        ),
     )
     parser.add_argument(
-        "--use-gpu",
+        "--device",
+        choices=["cpu", "cuda", "mps"],
+        default="cpu",
+        help="Local HD-BET device (default: cpu)",
+    )
+    parser.add_argument(
+        "--enable-tta",
         action="store_true",
-        help="Pass --gpus all to docker run (use a CUDA-based image, not the CPU Dockerfile)",
+        help="Enable HD-BET test-time augmentation (disabled by default)",
     )
     parser.add_argument("--benchmark-out", type=Path, default=None, help="Benchmark JSON path")
 
@@ -408,10 +476,11 @@ def _main() -> int:
 
     stripper = SkullStripper(
         output_dir=args.output_dir,
-        docker_image=args.docker_image,
         smoke_test=args.smoke_test,
         benchmark_out=args.benchmark_out,
-        use_gpu=args.use_gpu,
+        hdbet_bin=args.hdbet_bin,
+        device=args.device,
+        disable_tta=not args.enable_tta,
     )
 
     try:

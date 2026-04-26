@@ -12,7 +12,7 @@ Environment: Simulated cloud environment via the University of Utah CHPC.
 
 Cluster Configuration: 1 Driver Node (32GB RAM) and 4 Worker Nodes (16GB RAM each).
 
-Tech Stack: Python 3.9, PySpark 3.5, Docker, Spark MLlib.
+Tech Stack: Python 3.11, PySpark 3.5, HD-BET, Spark MLlib.
 
 Data Source: Kaggle WMH Segmentation Dataset (Paired T1, FLAIR, Expert Masks).
 
@@ -30,14 +30,14 @@ The system must ingest expert-annotated binary lesion masks to serve as the grou
 The pipeline must establish secure connections to the storage volume and mount the data efficiently for distributed reading across worker nodes.
 Technical Constraint: Memory limits require strict partitioning strategies to prevent Driver Node bottlenecks during initial I/O operations.
 
-Feature 2: Containerized Pre-Processing (HD-BET)
+Feature 2: Local Pre-Processing (HD-BET)
 
 Objective: Standardize skull-stripping to isolate brain tissue prior to PySpark feature extraction.
 Acceptance Criteria:
 
 The module must execute the High-Density Brain Extraction Tool (HD-BET) on all incoming raw T1 and FLAIR scans.
 
-The execution must be strictly containerized using Docker to ensure environment stability and consistent skull-stripping across all runs.
+The execution must use the pinned local HD-BET dependency stack to ensure environment stability and consistent skull-stripping across all runs.
 
 The output must successfully strip non-brain tissue (skull, eyes, background) to drastically reduce the total voxel count and prevent confounding variables from reaching the classifier.
 

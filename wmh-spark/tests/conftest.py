@@ -6,6 +6,8 @@ test suite in seconds without a real MRI dataset or a multi-node cluster.
 
 from __future__ import annotations
 
+import os
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -17,6 +19,9 @@ from wmh_spark.io_utils import save_volume
 @pytest.fixture(scope="session")
 def spark_session():
     from pyspark.sql import SparkSession
+
+    os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
+    os.environ.setdefault("PYSPARK_DRIVER_PYTHON", sys.executable)
 
     spark = (
         SparkSession.builder.appName("wmh-spark-test")

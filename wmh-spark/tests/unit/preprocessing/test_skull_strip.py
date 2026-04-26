@@ -13,13 +13,14 @@ import numpy as np
 import pytest
 
 from wmh_spark.preprocessing.skull_strip import (
-    DockerExecutionError,
-    DockerRunner,
+    HDBETExecutionError,
+    HDBETRunner,
     ProcessingLogEntry,
     RawScan,
     ScanPair,
     SkullStrippedOutput,
     SkullStripper,
+    _default_hdbet_executable,
     _derive_stem,
     _discover_pairs,
 )
@@ -65,59 +66,92 @@ class TestDataclasses:
 
 
 # ---------------------------------------------------------------------------
-# T007 — DockerRunner._build_command
+# T007 — HDBETRunner._build_command
 # ---------------------------------------------------------------------------
 
-class TestDockerRunner:
+class TestHDBETRunner:
     def _runner(self):
-        return DockerRunner("wmh-spark/hdbet:2.0.0")
+        return HDBETRunner("hd-bet")
 
-    def test_contains_pinned_image_not_latest(self):
+    def test_default_executable_prefers_current_python_environment(
+        self, tmp_path, monkeypatch
+    ):
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        python_path = bin_dir / "python"
+        hdbet_path = bin_dir / "hd-bet"
+        python_path.touch()
+        hdbet_path.touch()
+
+        monkeypatch.setattr(
+            "wmh_spark.preprocessing.skull_strip.sys.executable", str(python_path)
+        )
+
+        assert _default_hdbet_executable() == str(hdbet_path)
+        assert HDBETRunner().executable == str(hdbet_path)
+
+    def test_uses_local_executable_not_docker(self):
         cmd = self._runner()._build_command(
             Path("/data/T1.nii.gz"), Path("/out/T1_bet.nii.gz")
         )
-        assert "wmh-spark/hdbet:2.0.0" in cmd
-        assert "latest" not in " ".join(cmd)
+        assert cmd[0] == "hd-bet"
+        assert "docker" not in cmd
+        assert "-v" not in cmd
 
-    def test_no_gpu_flags_by_default(self):
+    def test_cpu_device_by_default(self):
         cmd = self._runner()._build_command(
             Path("/data/T1.nii.gz"), Path("/out/T1_bet.nii.gz")
         )
-        assert "--gpus" not in cmd
+        assert cmd[cmd.index("-device") + 1] == "cpu"
+        assert "--disable_tta" in cmd
 
-    def test_gpu_flag_present_when_enabled(self):
-        cmd = DockerRunner("wmh-spark/hdbet:2.0.0", use_gpu=True)._build_command(
+    def test_cuda_device_when_requested(self):
+        cmd = HDBETRunner("hd-bet", device="cuda", disable_tta=False)._build_command(
             Path("/data/T1.nii.gz"), Path("/out/T1_bet.nii.gz")
         )
-        assert "--gpus" in cmd
-        idx = cmd.index("--gpus")
-        assert cmd[idx + 1] == "all"
+        assert cmd[cmd.index("-device") + 1] == "cuda"
+        assert "--disable_tta" not in cmd
 
-    def test_input_volume_mount_is_readonly(self):
+    def test_saves_brain_mask_for_quality_gate(self):
+        cmd = self._runner()._build_command(
+            Path("/data/T1.nii.gz"), Path("/out/T1_bet.nii.gz")
+        )
+        assert "--save_bet_mask" in cmd
+
+    def test_output_uses_temporary_raw_stem_to_avoid_double_bet_mask(self):
         cmd = self._runner()._build_command(
             Path("/data/sub/T1.nii.gz"), Path("/out/sub/T1_bet.nii.gz")
         )
-        mounts = [cmd[i + 1] for i, c in enumerate(cmd) if c == "-v"]
-        assert any(":ro" in m for m in mounts)
+        assert cmd[cmd.index("-o") + 1] == "/out/sub/T1.nii.gz"
 
     def test_output_suffix_in_command(self):
         cmd = self._runner()._build_command(
             Path("/data/T1_RMS.nii.gz"), Path("/out/T1_RMS_bet.nii.gz")
         )
-        assert "T1_RMS_bet.nii.gz" in " ".join(cmd)
+        assert "T1_RMS.nii.gz" in " ".join(cmd)
 
-    def test_run_raises_docker_execution_error_on_nonzero_exit(self, tmp_path):
+    def test_run_raises_hdbet_execution_error_on_nonzero_exit(self, tmp_path):
         runner = self._runner()
         with patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=1, stderr="OOM error")
-            with pytest.raises(DockerExecutionError, match="OOM error"):
+            with pytest.raises(HDBETExecutionError, match="OOM error"):
                 runner.run(tmp_path / "T1.nii.gz", tmp_path / "T1_bet.nii.gz")
 
     def test_run_succeeds_on_zero_exit(self, tmp_path):
         runner = self._runner()
+        output_path = tmp_path / "T1_bet.nii.gz"
+
+        def fake_run(cmd, capture_output, text):
+            (tmp_path / "T1.nii.gz").write_bytes(b"stripped")
+            (tmp_path / "T1_bet.nii.gz").write_bytes(b"mask")
+            return MagicMock(returncode=0, stderr="", stdout="")
+
         with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0, stderr="")
-            runner.run(tmp_path / "T1.nii.gz", tmp_path / "T1_bet.nii.gz")
+            mock_run.side_effect = fake_run
+            runner.run(tmp_path / "T1.nii.gz", output_path)
+
+        assert output_path.read_bytes() == b"stripped"
+        assert (tmp_path / "T1_bet_mask.nii.gz").read_bytes() == b"mask"
 
 
 # ---------------------------------------------------------------------------
@@ -228,11 +262,11 @@ class TestSkullStripperProcessPair:
             result = stripper.process_pair(pair)
         assert result.status == "accepted"
 
-    def test_status_error_on_docker_failure(self, tmp_path):
+    def test_status_error_on_hdbet_failure(self, tmp_path):
         pair = self._make_pair(tmp_path)
         stripper = SkullStripper(output_dir=tmp_path / "out", smoke_test=True)
         with patch.object(stripper._runner, "run",
-                          side_effect=DockerExecutionError("OOM")):
+                          side_effect=HDBETExecutionError("OOM")):
             result = stripper.process_pair(pair)
         assert result.status == "error"
         assert "OOM" in result.error_message
@@ -356,7 +390,7 @@ class TestDeterministicOutput:
         fake_t1_content = b"deterministic_t1_nifti_bytes"
         fake_fl_content = b"deterministic_flair_nifti_bytes"
 
-        def mock_docker_run(input_path: Path, output_path: Path) -> None:
+        def mock_hdbet_run(input_path: Path, output_path: Path) -> None:
             output_path.parent.mkdir(parents=True, exist_ok=True)
             if "T1" in input_path.name:
                 output_path.write_bytes(fake_t1_content)
@@ -375,7 +409,7 @@ class TestDeterministicOutput:
         for run_idx in range(2):
             out_dir = tmp_path / f"run{run_idx}"
             stripper = SkullStripper(output_dir=out_dir, smoke_test=True)
-            with patch.object(stripper._runner, "run", side_effect=mock_docker_run), \
+            with patch.object(stripper._runner, "run", side_effect=mock_hdbet_run), \
                  patch(
                      "wmh_spark.preprocessing.quality_gate.QualityGate.assert_structural",
                      return_value=None,

@@ -4,18 +4,18 @@
 
 ## Summary
 
-Implement a skull-stripping preprocessing module that runs HD-BET inside a pinned Docker container on all raw T1 and FLAIR NIfTI scan pairs, validates output quality (DSC > 0.85 in Phase 2; structural assertions in Phase 1 smoke-test mode), and forwards accepted skull-stripped volumes to the existing `build_voxel_dataframe()` ingestion path. The module integrates with the existing `wmh_spark` package structure and follows TDD with tests written before implementation.
+Implement a skull-stripping preprocessing module that runs local HD-BET on all raw T1 and FLAIR NIfTI scan pairs, validates output quality (DSC > 0.85 in Phase 2; structural assertions in Phase 1 smoke-test mode), and forwards accepted skull-stripped volumes to the existing `build_voxel_dataframe()` ingestion path. The module integrates with the existing `wmh_spark` package structure and follows TDD with tests written before implementation.
 
 ## Technical Context
 
-**Language/Version**: Python 3.9  
-**Primary Dependencies**: HD-BET 2.0.0 (via Docker), NiBabel (existing), subprocess (stdlib), pytest (existing)  
+**Language/Version**: Python 3.11  
+**Primary Dependencies**: HD-BET 2.0.0, PyTorch CPU wheels, NiBabel (existing), subprocess (stdlib), pytest (existing)  
 **Storage**: NIfTI files on local filesystem (Phase 1) / CHPC network volume (Phase 2); JSON Lines benchmark logs  
-**Testing**: pytest; unit tests for Docker runner, quality gate, output naming; integration test against local `datasets/`  
-**Target Platform**: Linux (local dev + CHPC cluster nodes with GPU Docker)  
+**Testing**: pytest; unit tests for local HD-BET runner, quality gate, output naming; integration test against local `datasets/`  
+**Target Platform**: Linux (local dev + CHPC cluster nodes with local HD-BET installed)  
 **Project Type**: Pipeline preprocessing module (sits between raw data and PySpark ingestion)  
-**Performance Goals**: Process one scan pair in < 5 min with GPU Docker; deterministic output (bit-identical across runs on same image)  
-**Constraints**: Docker image tag MUST be pinned (`wmh-spark/hdbet:2.0.0`); no bare-metal HD-BET; DSC > 0.85 gate mandatory in Phase 2; TDD required  
+**Performance Goals**: Process one scan pair in < 5 min with GPU-capable local HD-BET; deterministic output (bit-identical across runs on same dependency versions)  
+**Constraints**: HD-BET and PyTorch versions MUST be pinned; DSC > 0.85 gate mandatory in Phase 2; TDD required  
 **Scale/Scope**: 4 scan pairs (smoke), ~hundreds of subjects (Kaggle Phase 2)
 
 ## Constitution Check
@@ -25,11 +25,11 @@ Implement a skull-stripping preprocessing module that runs HD-BET inside a pinne
 | Principle | Status | Notes |
 |-----------|--------|-------|
 | I. Distributed-First | **COMPLIANT** (justified exception) | Skull-stripping is a per-file NIfTI operation that must precede the 3D→2D voxel flattening boundary. It cannot be expressed as a DataFrame transformation. Accepted preprocessing boundary — outputs feed directly into `build_voxel_dataframe()`. |
-| II. Containerized Pre-Processing | **COMPLIANT** | HD-BET runs exclusively in `wmh-spark/hdbet:2.0.0` (pinned tag). Container execution orchestrated by the module, not invoked manually. |
+| II. Reproducible Pre-Processing | **COMPLIANT** | HD-BET runs through pinned local dependencies. Execution is orchestrated by the module, not invoked manually. |
 | III. Memory-Safe Partitioning | **N/A** | No PySpark operations in this module. Partition strategy applies downstream in `build_voxel_dataframe()`. |
 | IV. Accuracy-Gated Output | **COMPLIANT** | DSC > 0.85 gate enforced in Phase 2. Smoke-test exemption applied in Phase 1 with structural assertions per Constitution. |
 | V. Scalability & Benchmarking | **COMPLIANT** | Per-scan elapsed time and batch-level throughput logged to JSONL + benchmark JSON on every run. |
-| VI. Test-Driven Correctness | **COMPLIANT** | Tests written before implementation (Red-Green-Refactor). Unit tests cover Docker runner, quality gate, naming logic. Integration test covers end-to-end against local `datasets/`. |
+| VI. Test-Driven Correctness | **COMPLIANT** | Tests written before implementation (Red-Green-Refactor). Unit tests cover local runner, quality gate, naming logic. Integration test covers end-to-end against local `datasets/`. |
 
 **Post-design re-check**: No violations introduced in Phase 1 design. No Complexity Tracking entries required.
 
@@ -52,10 +52,6 @@ specs/002-hdbet-skull-strip/
 
 ```text
 wmh-spark/
-├── docker/
-│   └── hdbet/
-│       └── Dockerfile                    # HD-BET pinned Docker image definition
-│
 ├── src/wmh_spark/
 │   └── preprocessing/
 │       ├── __init__.py
@@ -65,7 +61,7 @@ wmh-spark/
 └── tests/
     ├── unit/
     │   └── preprocessing/
-    │       ├── test_skull_strip.py       # Docker runner, output naming, batch logic
+    │       ├── test_skull_strip.py       # Local HD-BET runner, output naming, batch logic
     │       └── test_quality_gate.py      # DSC gate, structural assertions, edge cases
     └── integration/
         └── preprocessing/

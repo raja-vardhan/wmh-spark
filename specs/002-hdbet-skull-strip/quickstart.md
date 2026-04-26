@@ -2,20 +2,25 @@
 
 ## Prerequisites
 
-- Docker installed and running with GPU support (`nvidia-container-toolkit`)
-- Python 3.9 environment with project dependencies installed (`pip install -e .` in `wmh-spark/`)
+- Python 3.11 environment with project dependencies installed (`pip install -r requirements.txt && pip install -e .` in `wmh-spark/`)
+- Local HD-BET CLI installed in the project environment (`hd-bet --help` when activated, or `.venv/bin/hd-bet --help`)
 
-## Step 1: Build the HD-BET Docker Image
+## Step 1: Install Local HD-BET Dependencies
 
 ```bash
-cd wmh-spark/docker/hdbet
-docker build -t wmh-spark/hdbet:2.0.0 .
+cd wmh-spark
+python -m pip install -r requirements.txt
+python -m pip install -e .
 ```
 
-Verify the build:
+Verify the CLI:
 ```bash
-docker run --rm wmh-spark/hdbet:2.0.0 hd_bet --help
+hd-bet --help
 ```
+
+The skull-strip module defaults to the `hd-bet` executable installed next to
+the Python interpreter running it, so `.venv/bin/python -m ...` works even if
+the virtualenv shell activation was skipped.
 
 ## Step 2: Run Skull-Stripping on Smoke-Test Dataset (Phase 1)
 
@@ -24,7 +29,8 @@ cd wmh-spark
 python -m wmh_spark.preprocessing.skull_strip \
     --input-dir ../datasets/ \
     --output-dir data/work/skull_stripped/ \
-    --smoke-test
+    --smoke-test \
+    --device cpu
 ```
 
 Expected output:
@@ -48,7 +54,8 @@ All tests must pass before proceeding to Phase 2.
 ```bash
 python -m wmh_spark.preprocessing.skull_strip \
     --manifest data/manifest.parquet \
-    --output-dir data/work/skull_stripped/
+    --output-dir data/work/skull_stripped/ \
+    --device cpu
 ```
 
 The DSC quality gate (> 0.85) is active by default in Phase 2 mode. Rejected scans are written to `data/work/skull_stripped/quarantine/`.
@@ -69,4 +76,4 @@ After any run, check the timing summary:
 cat data/output/metrics/skull_strip_benchmark.json
 ```
 
-Fields: `run_id`, `total_pairs`, `accepted`, `rejected`, `errors`, `total_elapsed_seconds`, `mean_seconds_per_pair`.
+Fields: `run_id`, `total_pairs`, `accepted`, `rejected`, `errors`, `total_elapsed_seconds`, `subjects_per_hour`.

@@ -8,7 +8,7 @@
 
 ### User Story 1 — Batch Skull-Strip Raw MRI Scan Pairs (Priority: P1)
 
-A pipeline engineer provides a batch of raw T1 and FLAIR NIfTI scan pairs. The module runs HD-BET inside Docker on each scan, producing brain-only volumes and binary brain masks. Successfully stripped scans are passed to downstream PySpark feature extraction; any scan failing the quality threshold is quarantined with a logged reason.
+A pipeline engineer provides a batch of raw T1 and FLAIR NIfTI scan pairs. The module runs local HD-BET on each scan, producing brain-only volumes and binary brain masks. Successfully stripped scans are passed to downstream PySpark feature extraction; any scan failing the quality threshold is quarantined with a logged reason.
 
 **Why this priority**: This is the core function of the module and a hard prerequisite for WMH classification — no other pipeline stage can proceed without skull-stripped inputs.
 
@@ -59,7 +59,7 @@ A pipeline maintainer needs to reprocess a single T1/FLAIR pair — either to de
 
 - What happens when a scan has severe motion artifacts that cause HD-BET to produce an incomplete brain mask?
 - How does the module handle NIfTI files with non-standard or missing orientation headers?
-- What if the Docker daemon is unavailable or the HD-BET container image has not been pulled on the execution node?
+- What if the local HD-BET executable is unavailable on the execution node?
 - What happens when one scan in a T1/FLAIR pair is missing or corrupted?
 - How are duplicate scan IDs handled if the same scan appears more than once in the input batch?
 
@@ -69,12 +69,12 @@ A pipeline maintainer needs to reprocess a single T1/FLAIR pair — either to de
 
 - **FR-001**: The module MUST accept a batch of raw T1 and FLAIR NIfTI scan pairs (`.nii` or `.nii.gz`) as input, specified via a directory path or a manifest file.
 - **FR-002**: The module MUST apply HD-BET skull-stripping independently to every T1 and FLAIR scan in the input batch.
-- **FR-003**: HD-BET MUST be executed exclusively within a Docker container; no host-level HD-BET installation shall be required or used.
+- **FR-003**: HD-BET MUST be executed via the local pinned dependency stack; no Docker daemon or container image shall be required.
 - **FR-004**: The module MUST produce two outputs per scan: a skull-stripped NIfTI volume (non-brain voxels zeroed) and a binary brain mask NIfTI volume.
 - **FR-005**: The module MUST validate each skull-stripped output against a DSC quality threshold of 0.85; outputs below the threshold MUST be quarantined and excluded from downstream handoff.
 - **FR-006**: The module MUST write a structured processing log per run recording one entry per scan pair: scan pair ID, processing status (accepted/rejected), measured DSC value (or null in smoke-test mode), and failure reason where applicable.
 - **FR-007**: The module MUST support single-scan reprocessing mode, allowing a specific T1/FLAIR pair to be reprocessed individually without affecting other outputs.
-- **FR-008**: The module MUST be deterministic — identical input scans MUST produce bit-identical outputs across runs on the same Docker image version.
+- **FR-008**: The module MUST be deterministic — identical input scans MUST produce bit-identical outputs across runs on the same pinned HD-BET dependency versions.
 - **FR-009**: The module MUST handle individual scan failures gracefully: a failure in one scan pair MUST NOT halt processing of the remaining batch.
 
 ### Key Entities
@@ -92,7 +92,7 @@ A pipeline maintainer needs to reprocess a single T1/FLAIR pair — either to de
 - **SC-001**: 100% of raw T1 and FLAIR scans submitted to the module are processed by HD-BET; no scans are silently skipped.
 - **SC-002**: Skull-stripped outputs achieve DSC > 0.85 compared to reference brain masks on the project's validation scan set.
 - **SC-003**: Output voxel count is reduced by at least 60% relative to the raw input for every accepted scan, confirming removal of skull and background.
-- **SC-004**: Processing is deterministic — re-running the module on the same input and Docker image version produces bit-identical outputs.
+- **SC-004**: Processing is deterministic — re-running the module on the same input and pinned HD-BET dependency versions produces bit-identical outputs.
 - **SC-005**: Any scan failing the DSC quality gate is excluded from downstream feature extraction with zero false passes.
 - **SC-006**: A complete processing log is available at the end of every batch run, with one entry per scan pair including accept/reject status and DSC value.
 
@@ -100,8 +100,8 @@ A pipeline maintainer needs to reprocess a single T1/FLAIR pair — either to de
 
 - Input NIfTI files are already in standard orientation and do not require reorientation prior to skull-stripping.
 - T1 and FLAIR scans are skull-stripped independently (no co-registration required before stripping).
-- The HD-BET Docker image is pre-pulled and available on the CHPC cluster execution nodes before the module runs.
-- GPU-enabled Docker execution is available on CHPC cluster nodes, as HD-BET inference requires GPU acceleration for practical runtimes.
+- The HD-BET CLI is installed and available on the execution nodes before the module runs.
+- CPU execution is supported for local smoke tests; GPU execution can be selected with `--device cuda` when the local PyTorch stack supports CUDA.
 - Reference brain masks for DSC validation are available for the project's validation scan set (Phase 2 / Kaggle). In smoke-test mode (Phase 1, local `datasets/`), no reference masks are available and the DSC gate is skipped entirely; structural assertions replace it (binary mask, shape/affine match, foreground fraction 5–95%).
 - Output skull-stripped volumes are written to a configurable output directory that is accessible to the downstream PySpark feature extraction stage.
 - The DSC threshold of 0.85 is fixed per the project's existing quality standard and is not configurable per-run.

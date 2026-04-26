@@ -1,6 +1,6 @@
 """Integration tests for skull_strip end-to-end pipeline.
 
-These tests mock Docker execution but exercise the full batch/single-subject
+These tests mock local HD-BET execution but exercise the full batch/single-subject
 flow including output file layout, log writing, and overwrite behaviour.
 T010, T024 per tasks.md.
 """
@@ -124,21 +124,21 @@ class TestSmokeBatch:
         assert bench["total_pairs"] == 1
 
     def test_single_pair_failure_does_not_halt_batch(self, tmp_path):
-        """FR-009: a Docker error on one pair must not stop the rest."""
+        """FR-009: an HD-BET error on one pair must not stop the rest."""
         for sub_id in ["sub-ok", "sub-fail"]:
             sub_dir = tmp_path / "input" / sub_id
             sub_dir.mkdir(parents=True)
             _write_valid_nifti(sub_dir / "T1_RMS.nii.gz")
             _write_valid_nifti(sub_dir / "FLAIR.nii.gz")
 
-        from wmh_spark.preprocessing.skull_strip import DockerExecutionError
+        from wmh_spark.preprocessing.skull_strip import HDBETExecutionError
 
         call_count = [0]
 
         def selective_fail(input_path: Path, output_path: Path) -> None:
             call_count[0] += 1
             if "sub-fail" in str(input_path):
-                raise DockerExecutionError("injected failure")
+                raise HDBETExecutionError("injected failure")
             _mock_hdbet_run(input_path, output_path)
 
         stripper = SkullStripper(
