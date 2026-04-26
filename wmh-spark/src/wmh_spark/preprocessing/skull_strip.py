@@ -83,18 +83,24 @@ class ProcessingLogEntry:
 
 
 class DockerRunner:
-    def __init__(self, image: str) -> None:
+    def __init__(self, image: str, use_gpu: bool = False) -> None:
         self.image = image
+        self.use_gpu = use_gpu
 
     def _build_command(self, input_path: Path, output_path: Path) -> List[str]:
-        return [
-            "docker", "run", "--rm", "--gpus", "all",
-            "-v", f"{input_path.parent}:/input:ro",
-            "-v", f"{output_path.parent}:/output",
-            self.image,
-            "-i", f"/input/{input_path.name}",
-            "-o", f"/output/{output_path.name}",
-        ]
+        cmd: List[str] = ["docker", "run", "--rm"]
+        if self.use_gpu:
+            cmd.extend(["--gpus", "all"])
+        cmd.extend(
+            [
+                "-v", f"{input_path.parent}:/input:ro",
+                "-v", f"{output_path.parent}:/output",
+                self.image,
+                "-i", f"/input/{input_path.name}",
+                "-o", f"/output/{output_path.name}",
+            ]
+        )
+        return cmd
 
     def run(self, input_path: Path, output_path: Path) -> None:
         cmd = self._build_command(input_path, output_path)
@@ -184,12 +190,13 @@ class SkullStripper:
         docker_image: str = DEFAULT_IMAGE,
         smoke_test: bool = False,
         benchmark_out: Optional[Path | str] = None,
+        use_gpu: bool = False,
     ) -> None:
         self.output_dir = Path(output_dir)
         self.docker_image = docker_image
         self.smoke_test = smoke_test
         self.benchmark_out = Path(benchmark_out) if benchmark_out else None
-        self._runner = DockerRunner(docker_image)
+        self._runner = DockerRunner(docker_image, use_gpu=use_gpu)
         self._run_id = str(uuid.uuid4())[:8]
 
     def process_pair(self, pair: ScanPair) -> SkullStrippedOutput:
@@ -390,6 +397,11 @@ def _main() -> int:
         "--docker-image", type=str, default=SkullStripper.DEFAULT_IMAGE,
         help="Docker image tag (default: wmh-spark/hdbet:2.0.0)",
     )
+    parser.add_argument(
+        "--use-gpu",
+        action="store_true",
+        help="Pass --gpus all to docker run (use a CUDA-based image, not the CPU Dockerfile)",
+    )
     parser.add_argument("--benchmark-out", type=Path, default=None, help="Benchmark JSON path")
 
     args = parser.parse_args()
@@ -399,6 +411,7 @@ def _main() -> int:
         docker_image=args.docker_image,
         smoke_test=args.smoke_test,
         benchmark_out=args.benchmark_out,
+        use_gpu=args.use_gpu,
     )
 
     try:

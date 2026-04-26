@@ -79,8 +79,14 @@ class TestDockerRunner:
         assert "wmh-spark/hdbet:2.0.0" in cmd
         assert "latest" not in " ".join(cmd)
 
-    def test_gpu_flag_present(self):
+    def test_no_gpu_flags_by_default(self):
         cmd = self._runner()._build_command(
+            Path("/data/T1.nii.gz"), Path("/out/T1_bet.nii.gz")
+        )
+        assert "--gpus" not in cmd
+
+    def test_gpu_flag_present_when_enabled(self):
+        cmd = DockerRunner("wmh-spark/hdbet:2.0.0", use_gpu=True)._build_command(
             Path("/data/T1.nii.gz"), Path("/out/T1_bet.nii.gz")
         )
         assert "--gpus" in cmd
