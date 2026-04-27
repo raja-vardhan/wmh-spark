@@ -1,0 +1,125 @@
+"""Tests for the Spark MLlib Random Forest classification engine."""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+from pyspark.ml.classification import RandomForestClassificationModel
+
+from wmh_spark.feature_extraction import build_feature_dataframe
+from wmh_spark.io_utils import save_volume
+from wmh_spark.models.random_forest import (
+    ClassificationConfig,
+    predict_voxel_mask,
+    prepare_training_dataframe,
+    train_random_forest_model,
+)
+
+
+def _write_spatial_prior(path, shape, affine):
+    z_idx, y_idx, x_idx = np.indices(shape, dtype=np.float32)
+    prior = (x_idx + y_idx + z_idx).astype(np.float32) / max(shape)
+    save_volume(prior, affine, path)
+
+
+def _small_labeled_feature_df(spark_session):
+    rows = []
+    for i in range(48):
+        label = 1 if i % 6 == 0 else 0
+        flair = float(20 + i)
+        t1 = float(10 + (i * 2))
+        rows.append(
+            {
+                "subject_id": "tiny",
+                "x": i % 4,
+                "y": (i // 4) % 4,
+                "z": i // 16,
+                "t1": t1,
+                "flair": flair,
+                "t1_flair_ratio": t1 / flair,
+                "spatial_prior": float(label) * 0.8 + 0.05,
+                "label": label,
+            }
+        )
+    return spark_session.createDataFrame(rows).repartition(4)
+
+
+def test_prepare_training_dataframe_uses_feature3_columns_and_partitions(
+    spark_session,
+    synthetic_subject,
+    synthetic_volume_shape,
+    synthetic_affine,
+):
+    prior_path = synthetic_subject / "spatial_prior.nii.gz"
+    _write_spatial_prior(prior_path, synthetic_volume_shape, synthetic_affine)
+    feature_df = build_feature_dataframe(
+        spark=spark_session,
+        subject_id="subj_synth",
+        t1_path=synthetic_subject / "t1.nii.gz",
+        flair_path=synthetic_subject / "flair.nii.gz",
+        spatial_prior_path=prior_path,
+        mask_path=synthetic_subject / "wmh_mask.nii.gz",
+        partition_count=2,
+    )
+    config = ClassificationConfig(training_partitions=4)
+
+    prepared = prepare_training_dataframe(feature_df, config)
+    row = prepared.select("features").first()
+
+    assert prepared.rdd.getNumPartitions() == 4
+    assert spark_session.conf.get("spark.sql.shuffle.partitions") == "4"
+    assert row["features"].size == len(config.feature_columns)
+
+
+def test_train_random_forest_uses_spark_mllib_model(spark_session):
+    df = _small_labeled_feature_df(spark_session)
+    config = ClassificationConfig(num_trees=5, max_depth=3, training_partitions=4)
+
+    model = train_random_forest_model(df, config)
+
+    assert isinstance(model.stages[-1], RandomForestClassificationModel)
+    assert model.stages[-1].getNumTrees == config.num_trees
+
+
+def test_predict_voxel_mask_outputs_binary_column_and_preserves_rows(spark_session):
+    df = _small_labeled_feature_df(spark_session)
+    config = ClassificationConfig(num_trees=5, max_depth=3, training_partitions=4)
+    model = train_random_forest_model(df, config)
+
+    predicted = predict_voxel_mask(model, df, config)
+    values = {row["predicted_mask"] for row in predicted.select("predicted_mask").distinct().collect()}
+
+    assert predicted.count() == df.count()
+    assert values <= {0, 1}
+    assert "predicted_mask" in predicted.columns
+    assert predicted.schema["predicted_mask"].dataType.simpleString() == "int"
+
+
+def test_training_requires_label_column(spark_session):
+    df = _small_labeled_feature_df(spark_session).drop("label")
+
+    with pytest.raises(ValueError, match="label"):
+        train_random_forest_model(df, ClassificationConfig())
+
+
+def test_training_rejects_non_binary_labels(spark_session):
+    rows = [
+        {
+            "t1": 1.0,
+            "flair": 2.0,
+            "t1_flair_ratio": 0.5,
+            "spatial_prior": 0.1,
+            "label": 0,
+        },
+        {
+            "t1": 2.0,
+            "flair": 1.0,
+            "t1_flair_ratio": 2.0,
+            "spatial_prior": 0.9,
+            "label": 2,
+        },
+    ]
+    df = spark_session.createDataFrame(rows)
+
+    with pytest.raises(ValueError, match="binary"):
+        train_random_forest_model(df, ClassificationConfig())
