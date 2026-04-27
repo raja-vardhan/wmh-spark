@@ -47,6 +47,7 @@ sys.path.insert(0, str(ROOT / "wmh-spark" / "src"))
 
 import nibabel as nib  # noqa: E402
 from pyspark.sql import DataFrame, SparkSession  # noqa: E402
+from pyspark.sql import functions as F  # noqa: E402
 from tqdm import tqdm  # noqa: E402
 from tqdm.contrib.logging import logging_redirect_tqdm  # noqa: E402
 
@@ -65,6 +66,8 @@ from wmh_spark.feature_extraction import build_feature_dataframe  # noqa: E402
 from wmh_spark.io_utils import SubjectRecord, save_volume  # noqa: E402
 from wmh_spark.models import (  # noqa: E402
     ClassificationConfig,
+    ClassBalanceStats,
+    calculate_class_balance_stats,
     predict_voxel_mask,
     train_random_forest_model,
 )
@@ -153,9 +156,42 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--min-cluster-size", type=int, default=10)
     p.add_argument("--training-partitions", type=int, default=4)
     p.add_argument(
+        "--prediction-threshold",
+        type=float,
+        default=0.25,
+        help="Class-1 RF probability threshold for raw WMH mask generation.",
+    )
+    p.add_argument(
+        "--spark-master",
+        type=str,
+        default=None,
+        help=(
+            "Spark master URL. Default uses local[N] where N is "
+            "SLURM_CPUS_PER_TASK when available, otherwise local[4]."
+        ),
+    )
+    p.add_argument(
+        "--spark-driver-memory",
+        type=str,
+        default="6g",
+        help="Spark driver memory (default: 6g).",
+    )
+    p.add_argument(
+        "--spark-shuffle-partitions",
+        type=int,
+        default=8,
+        help="Spark SQL shuffle partitions (default: 8).",
+    )
+    p.add_argument(
         "--skip-skull-strip",
         action="store_true",
         help="Reuse cached HD-BET outputs under <output-root>/skull_stripped",
+    )
+    p.add_argument(
+        "--skull-strip-root",
+        type=Path,
+        default=None,
+        help="Optional existing skull_stripped directory to reuse with --skip-skull-strip.",
     )
     p.add_argument(
         "--preflight-only",
@@ -246,6 +282,16 @@ def _torch_backend_summary() -> str:
     if hasattr(torch.backends, "mps"):
         parts.append(f"mps_available={torch.backends.mps.is_available()}")
     return " ".join(parts)
+
+
+def _resolve_spark_master(args: argparse.Namespace) -> str:
+    """Resolve Spark master for local development / single-node Slurm jobs."""
+    if args.spark_master:
+        return args.spark_master
+    slurm_cpus = os.environ.get("SLURM_CPUS_PER_TASK")
+    if slurm_cpus and slurm_cpus.isdigit() and int(slurm_cpus) > 0:
+        return f"local[{slurm_cpus}]"
+    return "local[4]"
 
 
 def resolve_hdbet_device(requested: str) -> str:
@@ -447,9 +493,15 @@ def stage_skull_strip(
     test_records: List[SubjectRecord],
 ) -> Path:
     skull_root = args.output_root / "skull_stripped"
-    if args.skip_skull_strip and skull_root.exists():
-        logger.info("--skip-skull-strip: reusing %s", skull_root)
-        return skull_root
+    if args.skip_skull_strip:
+        cached_root = args.skull_strip_root or skull_root
+        if cached_root.exists():
+            logger.info("--skip-skull-strip: reusing %s", cached_root)
+            return cached_root
+        raise FileNotFoundError(
+            "--skip-skull-strip requested but cached HD-BET outputs were not found: "
+            f"{cached_root}"
+        )
 
     skull_root.mkdir(parents=True, exist_ok=True)
     stripper = SkullStripper(
@@ -566,7 +618,7 @@ def stage_train(
     args: argparse.Namespace,
     skull_root: Path,
     train_records: List[SubjectRecord],
-):
+) -> tuple[object, ClassificationConfig, ClassBalanceStats]:
     logger.info("building training feature DataFrames: subjects=%d", len(train_records))
     feature_dfs: List[DataFrame] = []
     for r in _progress(train_records, args, desc="train features", unit="subject"):
@@ -597,13 +649,23 @@ def stage_train(
         max_depth=args.max_depth,
         training_partitions=args.training_partitions,
         seed=args.seed,
+        prediction_threshold=args.prediction_threshold,
     )
+    balance_stats = calculate_class_balance_stats(training, rf_config)
     logger.info(
-        "training RF: subjects=%d trees=%d max_depth=%d",
-        len(feature_dfs), rf_config.num_trees, rf_config.max_depth,
+        (
+            "training RF: subjects=%d trees=%d max_depth=%d "
+            "negative_count=%d positive_count=%d positive_weight=%.4f"
+        ),
+        len(feature_dfs),
+        rf_config.num_trees,
+        rf_config.max_depth,
+        balance_stats.negative_count,
+        balance_stats.positive_count,
+        balance_stats.positive_class_weight,
     )
-    model = train_random_forest_model(training, rf_config)
-    return model, rf_config
+    model = train_random_forest_model(training, rf_config, balance_stats=balance_stats)
+    return model, rf_config, balance_stats
 
 
 def stage_predict_one(
@@ -617,7 +679,8 @@ def stage_predict_one(
 ):
     """Run inference + postprocess for one subject.
 
-    Returns ``(flair, pred_mask, affine, gt_mask, dice_result_or_None)``.
+    Returns ``(flair, pred_mask, affine, gt_mask, dice_result_or_None,
+    raw_predicted_voxels, max_wmh_probability)``.
 
     Axis convention (matches build_voxel_dataframe): the DataFrame columns
     'z'/'y'/'x' are the first/second/third axis indices into the NIfTI array,
@@ -633,7 +696,14 @@ def stage_predict_one(
         spatial_prior_path=prior,
         mask_path=record.gt_mask_path,
     )
-    raw = predict_voxel_mask(model, feat, rf_config)
+    raw = predict_voxel_mask(model, feat, rf_config).cache()
+    raw_diag = raw.agg(
+        F.sum(F.col(rf_config.mask_column)).alias("raw_predicted_voxels"),
+        F.max(F.col(rf_config.positive_probability_column)).alias("max_wmh_probability"),
+    ).first()
+    raw_predicted_voxels = int(raw_diag["raw_predicted_voxels"] or 0)
+    max_wmh_probability = raw_diag["max_wmh_probability"]
+    max_wmh_probability = float(max_wmh_probability) if max_wmh_probability is not None else None
 
     flair_img = nib.load(str(flair_bet))
     flair = np.asarray(flair_img.dataobj, dtype=np.float32)
@@ -672,7 +742,9 @@ def stage_predict_one(
         except ValueError:
             dice = None
 
-    return flair, pred, affine, gt, dice
+    raw.unpersist()
+
+    return flair, pred, affine, gt, dice, raw_predicted_voxels, max_wmh_probability
 
 
 # ---------------------------------------------------------------------------
@@ -683,6 +755,8 @@ def stage_predict_one(
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     args = _parse_args()
+    if not 0.0 <= args.prediction_threshold <= 1.0:
+        raise ValueError("--prediction-threshold must be between 0 and 1")
 
     t_start = time.time()
 
@@ -712,18 +786,24 @@ def main() -> int:
         skull_root = stage_skull_strip(args, train_records, test_records)
         stage_spatial_prior(args, skull_root, train_records + test_records)
 
-        logger.info("starting Spark session")
+        spark_master = _resolve_spark_master(args)
+        logger.info(
+            "starting Spark session: master=%s driver_memory=%s shuffle_partitions=%d",
+            spark_master,
+            args.spark_driver_memory,
+            args.spark_shuffle_partitions,
+        )
         spark = (
             SparkSession.builder.appName("wmh-spark-pipeline")
-            .master("local[4]")
-            .config("spark.driver.memory", "6g")
-            .config("spark.sql.shuffle.partitions", "8")
+            .master(spark_master)
+            .config("spark.driver.memory", args.spark_driver_memory)
+            .config("spark.sql.shuffle.partitions", str(args.spark_shuffle_partitions))
             .getOrCreate()
         )
         spark.sparkContext.setLogLevel("WARN")
 
         try:
-            model, rf_config = stage_train(spark, args, skull_root, train_records)
+            model, rf_config, balance_stats = stage_train(spark, args, skull_root, train_records)
 
             model_dir = args.output_root / "model"
             if model_dir.exists():
@@ -741,7 +821,15 @@ def main() -> int:
 
             for r in _progress(test_records, args, desc="predict/report", unit="subject"):
                 t0 = time.time()
-                flair, pred, affine, gt, dice = stage_predict_one(
+                (
+                    flair,
+                    pred,
+                    affine,
+                    gt,
+                    dice,
+                    raw_predicted_voxels,
+                    max_wmh_probability,
+                ) = stage_predict_one(
                     spark, args, skull_root, r, model, rf_config, pred_dir
                 )
                 vox_mm3 = voxel_volume_mm3(affine)
@@ -763,6 +851,9 @@ def main() -> int:
                     predicted_volume_mm3=predicted_volume,
                     reference_volume_mm3=reference_volume,
                     voxel_volume_mm3=vox_mm3,
+                    raw_predicted_voxels=raw_predicted_voxels,
+                    max_wmh_probability=max_wmh_probability,
+                    prediction_threshold=rf_config.prediction_threshold,
                 )
                 all_metrics.append(metrics)
 
@@ -785,11 +876,16 @@ def main() -> int:
                     output_path=bench_dir / "subject_bench.jsonl",
                 )
                 logger.info(
-                    "[%s] dsc=%s lesions=%d pred_vox=%d elapsed=%.1fs",
+                    (
+                        "[%s] dsc=%s lesions=%d raw_pred_vox=%d pred_vox=%d "
+                        "max_prob=%s elapsed=%.1fs"
+                    ),
                     r.subject_id,
                     f"{dice.dsc:.4f}" if dice else "n/a",
                     lesion_count,
+                    raw_predicted_voxels,
                     predicted_voxels,
+                    f"{max_wmh_probability:.4f}" if max_wmh_probability is not None else "n/a",
                     elapsed,
                 )
 
@@ -806,6 +902,12 @@ def main() -> int:
                 "rf_num_trees": rf_config.num_trees,
                 "rf_max_depth": rf_config.max_depth,
                 "min_cluster_size": args.min_cluster_size,
+                "prediction_threshold": rf_config.prediction_threshold,
+                "class_weighting": True,
+                "positive_class_weight": balance_stats.positive_class_weight,
+                "positive_class_weight_cap": rf_config.positive_class_weight_cap,
+                "training_positive_count": balance_stats.positive_count,
+                "training_negative_count": balance_stats.negative_count,
             }
             (bench_dir / "summary.json").write_text(json.dumps(summary, indent=2))
             logger.info("DONE: %s", json.dumps(summary))

@@ -1,7 +1,10 @@
 """Spark ML model APIs."""
 
 from wmh_spark.models.random_forest import (
+    ClassBalanceStats,
     ClassificationConfig,
+    add_class_weight_column,
+    calculate_class_balance_stats,
     predict_voxel_mask,
     prepare_training_dataframe,
     train_random_forest_model,
@@ -10,7 +13,10 @@ from wmh_spark.models.random_forest import (
 )
 
 __all__ = [
+    "ClassBalanceStats",
     "ClassificationConfig",
+    "add_class_weight_column",
+    "calculate_class_balance_stats",
     "predict_voxel_mask",
     "prepare_training_dataframe",
     "train_random_forest_model",

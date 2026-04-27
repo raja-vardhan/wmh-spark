@@ -37,12 +37,16 @@ class SubjectMetrics:
     predicted_volume_mm3: float
     reference_volume_mm3: Optional[float]
     voxel_volume_mm3: float
+    raw_predicted_voxels: Optional[int] = None
+    max_wmh_probability: Optional[float] = None
+    prediction_threshold: Optional[float] = None
 
     def to_dict(self) -> dict:
         return {
             "subject_id": self.subject_id,
             "site": self.site,
             "dsc": self.dsc,
+            "raw_predicted_voxels": self.raw_predicted_voxels,
             "predicted_voxels": self.predicted_voxels,
             "reference_voxels": self.reference_voxels,
             "intersection": self.intersection,
@@ -50,6 +54,8 @@ class SubjectMetrics:
             "predicted_volume_mm3": self.predicted_volume_mm3,
             "reference_volume_mm3": self.reference_volume_mm3,
             "voxel_volume_mm3": self.voxel_volume_mm3,
+            "max_wmh_probability": self.max_wmh_probability,
+            "prediction_threshold": self.prediction_threshold,
         }
 
 
@@ -151,11 +157,14 @@ _SUBJECT_HTML = """<!doctype html>
 <table>
   <tr><th>Metric</th><th>Value</th></tr>
   <tr><td>Dice (DSC)</td><td>{dsc}</td></tr>
+  <tr><td>Raw predicted lesion voxels</td><td>{raw_pv}</td></tr>
   <tr><td>Predicted lesion voxels</td><td>{pv:,}</td></tr>
   <tr><td>Reference lesion voxels</td><td>{rv}</td></tr>
   <tr><td>Predicted lesion clusters</td><td>{lc}</td></tr>
   <tr><td>Predicted volume (mm³)</td><td>{pvol:,.1f}</td></tr>
   <tr><td>Reference volume (mm³)</td><td>{rvol}</td></tr>
+  <tr><td>Max WMH probability</td><td>{max_prob}</td></tr>
+  <tr><td>Prediction threshold</td><td>{pred_threshold}</td></tr>
 </table>
 <p class="muted">Red = predicted WMH (α=0.5). Green outline = ground truth.</p>
 </body></html>
@@ -178,11 +187,14 @@ def write_subject_report(metrics: SubjectMetrics, out_dir: Path) -> Path:
             site=metrics.site or "—",
             vox=metrics.voxel_volume_mm3,
             dsc=_fmt_optional(metrics.dsc, ".4f"),
+            raw_pv=_fmt_optional(metrics.raw_predicted_voxels, ",d"),
             pv=metrics.predicted_voxels,
             rv=_fmt_optional(metrics.reference_voxels, ",d"),
             lc=metrics.lesion_count,
             pvol=metrics.predicted_volume_mm3,
             rvol=_fmt_optional(metrics.reference_volume_mm3, ",.1f"),
+            max_prob=_fmt_optional(metrics.max_wmh_probability, ".4f"),
+            pred_threshold=_fmt_optional(metrics.prediction_threshold, ".4f"),
         )
     )
     return html_path
@@ -254,6 +266,7 @@ def write_aggregate_report(
             f"<td><a href='{per_subject_subdir}/{m.subject_id}/report.html'>{m.subject_id}</a></td>"
             f"<td>{m.site or '—'}</td>"
             f"<td>{_fmt_optional(m.dsc, '.4f')}</td>"
+            f"<td>{_fmt_optional(m.raw_predicted_voxels, ',d')}</td>"
             f"<td>{m.lesion_count}</td>"
             f"<td>{m.predicted_volume_mm3:,.1f}</td>"
             f"<td>{_fmt_optional(m.reference_volume_mm3, ',.1f')}</td>"
@@ -281,7 +294,7 @@ def write_aggregate_report(
 <div class="images">{images}</div>
 <h2>Per-subject results</h2>
 <table>
-  <tr><th>Subject</th><th>Site</th><th>Dice</th><th>Lesions</th>
+  <tr><th>Subject</th><th>Site</th><th>Dice</th><th>Raw voxels</th><th>Lesions</th>
       <th>Predicted vol (mm³)</th><th>Reference vol (mm³)</th></tr>
   {''.join(rows)}
 </table>

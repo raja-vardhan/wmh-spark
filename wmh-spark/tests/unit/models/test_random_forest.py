@@ -5,11 +5,13 @@ from __future__ import annotations
 import numpy as np
 import pytest
 from pyspark.ml.classification import RandomForestClassificationModel
+from pyspark.ml.linalg import Vectors
 
 from wmh_spark.feature_extraction import build_feature_dataframe
 from wmh_spark.io_utils import save_volume
 from wmh_spark.models.random_forest import (
     ClassificationConfig,
+    calculate_class_balance_stats,
     predict_voxel_mask,
     prepare_training_dataframe,
     train_random_forest_model,
@@ -44,6 +46,11 @@ def _small_labeled_feature_df(spark_session):
     return spark_session.createDataFrame(rows).repartition(4)
 
 
+class _StaticProbabilityModel:
+    def transform(self, df):
+        return df
+
+
 def test_prepare_training_dataframe_uses_feature3_columns_and_partitions(
     spark_session,
     synthetic_subject,
@@ -64,11 +71,23 @@ def test_prepare_training_dataframe_uses_feature3_columns_and_partitions(
     config = ClassificationConfig(training_partitions=4)
 
     prepared = prepare_training_dataframe(feature_df, config)
-    row = prepared.select("features").first()
+    row = prepared.select("features", "class_weight").where("label = 1").first()
 
     assert prepared.rdd.getNumPartitions() == 4
     assert spark_session.conf.get("spark.sql.shuffle.partitions") == "4"
     assert row["features"].size == len(config.feature_columns)
+    assert row["class_weight"] > 1.0
+
+
+def test_class_balance_stats_caps_positive_weight(spark_session):
+    df = _small_labeled_feature_df(spark_session)
+    config = ClassificationConfig(positive_class_weight_cap=3.0)
+
+    stats = calculate_class_balance_stats(df, config)
+
+    assert stats.negative_count == 40
+    assert stats.positive_count == 8
+    assert stats.positive_class_weight == pytest.approx(3.0)
 
 
 def test_train_random_forest_uses_spark_mllib_model(spark_session):
@@ -79,6 +98,7 @@ def test_train_random_forest_uses_spark_mllib_model(spark_session):
 
     assert isinstance(model.stages[-1], RandomForestClassificationModel)
     assert model.stages[-1].getNumTrees == config.num_trees
+    assert model.stages[-1].getWeightCol() == config.weight_column
 
 
 def test_predict_voxel_mask_outputs_binary_column_and_preserves_rows(spark_session):
@@ -91,8 +111,39 @@ def test_predict_voxel_mask_outputs_binary_column_and_preserves_rows(spark_sessi
 
     assert predicted.count() == df.count()
     assert values <= {0, 1}
+    assert "wmh_probability" in predicted.columns
     assert "predicted_mask" in predicted.columns
+    assert predicted.schema["wmh_probability"].dataType.simpleString() == "double"
     assert predicted.schema["predicted_mask"].dataType.simpleString() == "int"
+
+
+def test_predict_voxel_mask_thresholds_wmh_probability(spark_session):
+    rows = [
+        {
+            "t1": 1.0,
+            "flair": 2.0,
+            "t1_flair_ratio": 0.5,
+            "spatial_prior": 0.1,
+            "probability": Vectors.dense([0.8, 0.2]),
+        },
+        {
+            "t1": 2.0,
+            "flair": 3.0,
+            "t1_flair_ratio": 2.0 / 3.0,
+            "spatial_prior": 0.9,
+            "probability": Vectors.dense([0.7, 0.3]),
+        },
+    ]
+    df = spark_session.createDataFrame(rows)
+    config = ClassificationConfig(prediction_threshold=0.25)
+
+    predicted = predict_voxel_mask(_StaticProbabilityModel(), df, config)
+    result = predicted.select("wmh_probability", "predicted_mask").collect()
+
+    assert result[0]["wmh_probability"] == pytest.approx(0.2)
+    assert result[0]["predicted_mask"] == 0
+    assert result[1]["wmh_probability"] == pytest.approx(0.3)
+    assert result[1]["predicted_mask"] == 1
 
 
 def test_training_requires_label_column(spark_session):
@@ -122,4 +173,27 @@ def test_training_rejects_non_binary_labels(spark_session):
     df = spark_session.createDataFrame(rows)
 
     with pytest.raises(ValueError, match="binary"):
+        train_random_forest_model(df, ClassificationConfig())
+
+
+def test_training_requires_both_binary_classes(spark_session):
+    rows = [
+        {
+            "t1": 1.0,
+            "flair": 2.0,
+            "t1_flair_ratio": 0.5,
+            "spatial_prior": 0.1,
+            "label": 0,
+        },
+        {
+            "t1": 2.0,
+            "flair": 3.0,
+            "t1_flair_ratio": 2.0 / 3.0,
+            "spatial_prior": 0.2,
+            "label": 0,
+        },
+    ]
+    df = spark_session.createDataFrame(rows)
+
+    with pytest.raises(ValueError, match="both background and WMH"):
         train_random_forest_model(df, ClassificationConfig())
