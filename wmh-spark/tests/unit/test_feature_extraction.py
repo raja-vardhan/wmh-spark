@@ -8,7 +8,9 @@ from pyspark.sql import functions as F
 
 from wmh_spark.feature_extraction import (
     FeaturePartitionPlan,
+    SubjectFeatureTask,
     build_feature_dataframe,
+    build_feature_dataframe_for_tasks,
     derive_feature_partition_count,
 )
 from wmh_spark.io_utils import load_volume, save_volume
@@ -181,3 +183,107 @@ def test_build_feature_dataframe_applies_partition_plan(
 
     assert spark_session.conf.get("spark.sql.shuffle.partitions") == "5"
     assert df.rdd.getNumPartitions() == 5
+
+
+def test_build_feature_dataframe_sparse_retains_only_brain_voxels(
+    spark_session,
+    synthetic_subject,
+    synthetic_volume_shape,
+    synthetic_affine,
+):
+    prior_path = synthetic_subject / "spatial_prior.nii.gz"
+    _write_spatial_prior(prior_path, synthetic_volume_shape, synthetic_affine)
+
+    dense = build_feature_dataframe(
+        spark=spark_session,
+        subject_id="subj_synth",
+        t1_path=synthetic_subject / "t1.nii.gz",
+        flair_path=synthetic_subject / "flair.nii.gz",
+        spatial_prior_path=prior_path,
+        partition_count=2,
+    )
+    sparse = build_feature_dataframe(
+        spark=spark_session,
+        subject_id="subj_synth",
+        t1_path=synthetic_subject / "t1.nii.gz",
+        flair_path=synthetic_subject / "flair.nii.gz",
+        spatial_prior_path=prior_path,
+        partition_count=2,
+        sparse_brain_only=True,
+        include_shape_columns=True,
+    )
+
+    dense_brain = dense.where((F.abs(F.col("t1")) > 1e-6) | (F.abs(F.col("flair")) > 1e-6))
+    assert sparse.count() == dense_brain.count()
+    assert sparse.count() < dense.count()
+    assert {"shape_z", "shape_y", "shape_x"} <= set(sparse.columns)
+
+    coord = dense_brain.select("x", "y", "z").first()
+    dense_row = (
+        dense.where(
+            (F.col("x") == coord["x"])
+            & (F.col("y") == coord["y"])
+            & (F.col("z") == coord["z"])
+        )
+        .select("t1", "flair", "spatial_prior", "distance_to_center")
+        .first()
+    )
+    sparse_row = (
+        sparse.where(
+            (F.col("x") == coord["x"])
+            & (F.col("y") == coord["y"])
+            & (F.col("z") == coord["z"])
+        )
+        .select("t1", "flair", "spatial_prior", "distance_to_center")
+        .first()
+    )
+    assert sparse_row == dense_row
+
+
+def test_build_feature_dataframe_for_tasks_combines_sparse_subjects(
+    spark_session,
+    synthetic_subject,
+    synthetic_volume_shape,
+    synthetic_affine,
+    tmp_path,
+):
+    prior_a = synthetic_subject / "spatial_prior_a.nii.gz"
+    _write_spatial_prior(prior_a, synthetic_volume_shape, synthetic_affine)
+
+    subject_b = tmp_path / "subj_b"
+    subject_b.mkdir()
+    for name in ("t1.nii.gz", "flair.nii.gz", "wmh_mask.nii.gz"):
+        data, affine = load_volume(synthetic_subject / name)
+        save_volume(data, affine, subject_b / name, dtype=np.uint8 if "mask" in name else np.float32)
+    prior_b = subject_b / "spatial_prior_b.nii.gz"
+    _write_spatial_prior(prior_b, synthetic_volume_shape, synthetic_affine)
+
+    tasks = [
+        SubjectFeatureTask(
+            subject_id="subj_a",
+            t1_path=str(synthetic_subject / "t1.nii.gz"),
+            flair_path=str(synthetic_subject / "flair.nii.gz"),
+            spatial_prior_path=str(prior_a),
+            mask_path=str(synthetic_subject / "wmh_mask.nii.gz"),
+        ),
+        SubjectFeatureTask(
+            subject_id="subj_b",
+            t1_path=str(subject_b / "t1.nii.gz"),
+            flair_path=str(subject_b / "flair.nii.gz"),
+            spatial_prior_path=str(prior_b),
+            mask_path=str(subject_b / "wmh_mask.nii.gz"),
+        ),
+    ]
+
+    df = build_feature_dataframe_for_tasks(
+        spark_session,
+        tasks,
+        subject_parallelism=2,
+        sparse_brain_only=True,
+        include_shape_columns=True,
+        include_label=True,
+    )
+
+    assert {row["subject_id"] for row in df.select("subject_id").distinct().collect()} == {"subj_a", "subj_b"}
+    assert {"shape_z", "shape_y", "shape_x", "label"} <= set(df.columns)
+    assert df.where(F.col("label") == 1).count() > 0

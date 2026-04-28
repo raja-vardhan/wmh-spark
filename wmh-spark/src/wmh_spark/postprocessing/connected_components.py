@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Sequence
@@ -43,6 +44,20 @@ def _validate_required_columns(df: "DataFrame", config: PostProcessingConfig) ->
     missing = [column for column in required if column not in df.columns]
     if missing:
         raise ValueError(f"missing required post-processing columns: {missing}")
+
+
+def _validate_grouped_summary_columns(df: "DataFrame", config: PostProcessingConfig) -> None:
+    required = [
+        "subject_id",
+        "shape_z",
+        "shape_y",
+        "shape_x",
+        *COORDINATE_COLUMNS,
+        config.prediction_column,
+    ]
+    missing = [column for column in required if column not in df.columns]
+    if missing:
+        raise ValueError(f"missing required grouped post-processing columns: {missing}")
 
 
 def _validate_config(config: PostProcessingConfig) -> None:
@@ -336,3 +351,126 @@ def postprocess_predictions(
         config.anatomical_gate_enabled,
     )
     return result
+
+
+def _reconstruct_sparse_volume_from_pdf(pdf, shape: tuple[int, int, int], column: str, dtype):
+    values = np.zeros(shape, dtype=dtype)
+    z = pdf["z"].to_numpy(dtype=np.int32)
+    y = pdf["y"].to_numpy(dtype=np.int32)
+    x = pdf["x"].to_numpy(dtype=np.int32)
+    values[z, y, x] = pdf[column].fillna(0).to_numpy(dtype=dtype)
+    return values
+
+
+def _summarize_subject_prediction_pdf(pdf, config: PostProcessingConfig):
+    import pandas as pd
+
+    _validate_config(config)
+    subject_id = str(pdf["subject_id"].iloc[0])
+    shape = (
+        int(pdf["shape_z"].iloc[0]),
+        int(pdf["shape_y"].iloc[0]),
+        int(pdf["shape_x"].iloc[0]),
+    )
+    prediction_volume = _reconstruct_sparse_volume_from_pdf(
+        pdf,
+        shape,
+        config.prediction_column,
+        np.int32,
+    ).astype(np.uint8, copy=False)
+    raw_predicted_voxels = int(prediction_volume.sum())
+    max_wmh_probability = None
+    if config.probability_column in pdf.columns:
+        probabilities = pdf[config.probability_column].dropna()
+        if not probabilities.empty:
+            max_wmh_probability = float(probabilities.max())
+
+    labeled, component_count = label_connected_components(prediction_volume)
+    sizes = component_size_map(labeled)
+    mean_probabilities: dict[int, float] = {}
+    peak_probabilities: dict[int, float] = {}
+    mean_spatial_priors: dict[int, float] = {}
+    if sizes:
+        probability_required = (
+            config.min_component_mean_probability > 0
+            or config.min_component_peak_probability > 0
+        )
+        if config.probability_column in pdf.columns:
+            probability_volume = _reconstruct_sparse_volume_from_pdf(
+                pdf,
+                shape,
+                config.probability_column,
+                np.float32,
+            )
+            mean_probabilities = _component_stat_map(labeled, probability_volume, reducer="mean")
+            peak_probabilities = _component_stat_map(labeled, probability_volume, reducer="max")
+        elif probability_required:
+            raise ValueError(f"missing required scalar column: {config.probability_column}")
+
+        if config.anatomical_gate_enabled or config.min_component_mean_spatial_prior > 0:
+            if config.spatial_prior_column not in pdf.columns:
+                raise ValueError(f"missing required scalar column: {config.spatial_prior_column}")
+            spatial_prior_volume = _reconstruct_sparse_volume_from_pdf(
+                pdf,
+                shape,
+                config.spatial_prior_column,
+                np.float32,
+            )
+            mean_spatial_priors = _component_stat_map(
+                labeled,
+                spatial_prior_volume,
+                reducer="mean",
+            )
+
+    filtered = filter_components(
+        labeled,
+        sizes,
+        mean_probabilities,
+        peak_probabilities,
+        mean_spatial_priors,
+        config,
+    )
+    positive_xyz = np.argwhere(filtered > 0).astype(np.int32).tolist()
+    return pd.DataFrame(
+        [
+            {
+                "subject_id": subject_id,
+                "shape_z": shape[0],
+                "shape_y": shape[1],
+                "shape_x": shape[2],
+                "positive_xyz_json": json.dumps(positive_xyz),
+                "raw_predicted_voxels": raw_predicted_voxels,
+                "max_wmh_probability": max_wmh_probability,
+                "predicted_voxels": int(filtered.sum()),
+                "component_count": int(component_count),
+            }
+        ]
+    )
+
+
+def summarize_subject_predictions(
+    df: "DataFrame",
+    config: PostProcessingConfig | None = None,
+) -> "DataFrame":
+    """Summarize sparse per-voxel predictions into one compact row per subject."""
+    from pyspark.sql.types import DoubleType, IntegerType, StringType, StructField, StructType
+
+    config = config or PostProcessingConfig()
+    _validate_grouped_summary_columns(df, config)
+    schema = StructType(
+        [
+            StructField("subject_id", StringType(), nullable=False),
+            StructField("shape_z", IntegerType(), nullable=False),
+            StructField("shape_y", IntegerType(), nullable=False),
+            StructField("shape_x", IntegerType(), nullable=False),
+            StructField("positive_xyz_json", StringType(), nullable=False),
+            StructField("raw_predicted_voxels", IntegerType(), nullable=False),
+            StructField("max_wmh_probability", DoubleType(), nullable=True),
+            StructField("predicted_voxels", IntegerType(), nullable=False),
+            StructField("component_count", IntegerType(), nullable=False),
+        ]
+    )
+    return df.groupBy("subject_id").applyInPandas(
+        lambda pdf: _summarize_subject_prediction_pdf(pdf, config),
+        schema=schema,
+    )

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pytest
 from pyspark.sql import functions as F
@@ -12,6 +14,7 @@ from wmh_spark.postprocessing.connected_components import (
     label_connected_components,
     postprocess_predictions,
     reconstruct_prediction_volume,
+    summarize_subject_predictions,
 )
 
 
@@ -159,3 +162,37 @@ def test_postprocess_predictions_filters_low_confidence_components(spark_session
         for row in result.where(F.col("postprocessed_mask") == 1).select("z", "y", "x").collect()
     }
     assert kept == {(0, 0, 0), (0, 0, 1)}
+
+
+def test_summarize_subject_predictions_compacts_sparse_rows(spark_session):
+    shape = (4, 4, 4)
+    large_cluster = {(0, 0, 0), (0, 0, 1), (0, 1, 1)}
+    tiny_cluster = {(3, 3, 3)}
+    rows = []
+    for z, y, x in sorted(large_cluster | tiny_cluster):
+        rows.append(
+            {
+                "subject_id": "subj",
+                "shape_z": shape[0],
+                "shape_y": shape[1],
+                "shape_x": shape[2],
+                "z": z,
+                "y": y,
+                "x": x,
+                "predicted_mask": 1,
+                "wmh_probability": 0.9,
+                "spatial_prior": 0.8,
+            }
+        )
+    df = spark_session.createDataFrame(rows).repartition(2)
+
+    summary = summarize_subject_predictions(
+        df,
+        PostProcessingConfig(min_cluster_size=2),
+    ).first()
+
+    kept = {tuple(coord) for coord in json.loads(summary["positive_xyz_json"])}
+    assert kept == large_cluster
+    assert summary["raw_predicted_voxels"] == 4
+    assert summary["predicted_voxels"] == 3
+    assert summary["component_count"] == 2

@@ -10,6 +10,7 @@ from wmh_spark.postprocessing.connected_components import (
     postprocess_predictions,
     reconstruct_prediction_volume,
     reconstruct_scalar_volume,
+    summarize_subject_predictions,
 )
 
 __all__ = [
@@ -22,4 +23,5 @@ __all__ = [
     "postprocess_predictions",
     "reconstruct_prediction_volume",
     "reconstruct_scalar_volume",
+    "summarize_subject_predictions",
 ]
