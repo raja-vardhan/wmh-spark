@@ -11,9 +11,12 @@ from wmh_spark.feature_extraction import build_feature_dataframe
 from wmh_spark.io_utils import save_volume
 from wmh_spark.models.random_forest import (
     ClassificationConfig,
+    append_probability_column,
     calculate_class_balance_stats,
+    downsample_negative_examples,
     predict_voxel_mask,
     prepare_training_dataframe,
+    select_prediction_threshold,
     train_random_forest_model,
 )
 
@@ -24,25 +27,60 @@ def _write_spatial_prior(path, shape, affine):
     save_volume(prior, affine, path)
 
 
+def _rich_feature_row(
+    *,
+    t1: float,
+    flair: float,
+    spatial_prior: float,
+    x: int = 0,
+    y: int = 0,
+    z: int = 0,
+    label: int | None = None,
+    probability=None,
+):
+    row = {
+        "x": x,
+        "y": y,
+        "z": z,
+        "t1": t1,
+        "flair": flair,
+        "t1_flair_ratio": t1 / flair if flair else 0.0,
+        "spatial_prior": spatial_prior,
+        "t1_zscore": t1 / 100.0,
+        "flair_zscore": flair / 100.0,
+        "t1_local_mean": t1 + 1.0,
+        "t1_local_std": 0.5,
+        "flair_local_mean": flair + 1.0,
+        "flair_local_std": 0.5,
+        "x_norm": x / 3.0 if x else 0.0,
+        "y_norm": y / 3.0 if y else 0.0,
+        "z_norm": z / 3.0 if z else 0.0,
+        "distance_to_center": 0.5,
+    }
+    if label is not None:
+        row["label"] = label
+    if probability is not None:
+        row["probability"] = probability
+    return row
+
+
 def _small_labeled_feature_df(spark_session):
     rows = []
     for i in range(48):
         label = 1 if i % 6 == 0 else 0
         flair = float(20 + i)
         t1 = float(10 + (i * 2))
-        rows.append(
-            {
-                "subject_id": "tiny",
-                "x": i % 4,
-                "y": (i // 4) % 4,
-                "z": i // 16,
-                "t1": t1,
-                "flair": flair,
-                "t1_flair_ratio": t1 / flair,
-                "spatial_prior": float(label) * 0.8 + 0.05,
-                "label": label,
-            }
+        row = _rich_feature_row(
+            x=i % 4,
+            y=(i // 4) % 4,
+            z=i // 16,
+            t1=t1,
+            flair=flair,
+            spatial_prior=float(label) * 0.8 + 0.05,
+            label=label,
         )
+        row["subject_id"] = "tiny"
+        rows.append(row)
     return spark_session.createDataFrame(rows).repartition(4)
 
 
@@ -119,20 +157,18 @@ def test_predict_voxel_mask_outputs_binary_column_and_preserves_rows(spark_sessi
 
 def test_predict_voxel_mask_thresholds_wmh_probability(spark_session):
     rows = [
-        {
-            "t1": 1.0,
-            "flair": 2.0,
-            "t1_flair_ratio": 0.5,
-            "spatial_prior": 0.1,
-            "probability": Vectors.dense([0.8, 0.2]),
-        },
-        {
-            "t1": 2.0,
-            "flair": 3.0,
-            "t1_flair_ratio": 2.0 / 3.0,
-            "spatial_prior": 0.9,
-            "probability": Vectors.dense([0.7, 0.3]),
-        },
+        _rich_feature_row(
+            t1=1.0,
+            flair=2.0,
+            spatial_prior=0.1,
+            probability=Vectors.dense([0.8, 0.2]),
+        ),
+        _rich_feature_row(
+            t1=2.0,
+            flair=3.0,
+            spatial_prior=0.9,
+            probability=Vectors.dense([0.7, 0.3]),
+        ),
     ]
     df = spark_session.createDataFrame(rows)
     config = ClassificationConfig(prediction_threshold=0.25)
@@ -155,20 +191,8 @@ def test_training_requires_label_column(spark_session):
 
 def test_training_rejects_non_binary_labels(spark_session):
     rows = [
-        {
-            "t1": 1.0,
-            "flair": 2.0,
-            "t1_flair_ratio": 0.5,
-            "spatial_prior": 0.1,
-            "label": 0,
-        },
-        {
-            "t1": 2.0,
-            "flair": 1.0,
-            "t1_flair_ratio": 2.0,
-            "spatial_prior": 0.9,
-            "label": 2,
-        },
+        _rich_feature_row(t1=1.0, flair=2.0, spatial_prior=0.1, label=0),
+        _rich_feature_row(t1=2.0, flair=1.0, spatial_prior=0.9, label=2),
     ]
     df = spark_session.createDataFrame(rows)
 
@@ -178,22 +202,57 @@ def test_training_rejects_non_binary_labels(spark_session):
 
 def test_training_requires_both_binary_classes(spark_session):
     rows = [
-        {
-            "t1": 1.0,
-            "flair": 2.0,
-            "t1_flair_ratio": 0.5,
-            "spatial_prior": 0.1,
-            "label": 0,
-        },
-        {
-            "t1": 2.0,
-            "flair": 3.0,
-            "t1_flair_ratio": 2.0 / 3.0,
-            "spatial_prior": 0.2,
-            "label": 0,
-        },
+        _rich_feature_row(t1=1.0, flair=2.0, spatial_prior=0.1, label=0),
+        _rich_feature_row(t1=2.0, flair=3.0, spatial_prior=0.2, label=0),
     ]
     df = spark_session.createDataFrame(rows)
 
     with pytest.raises(ValueError, match="both background and WMH"):
         train_random_forest_model(df, ClassificationConfig())
+
+
+def test_downsample_negative_examples_retains_all_positive_rows(spark_session):
+    df = _small_labeled_feature_df(spark_session)
+    config = ClassificationConfig(negative_sampling_ratio=1.0, seed=7)
+
+    sampled = downsample_negative_examples(df, config)
+
+    positive_original = df.where("label = 1").count()
+    positive_sampled = sampled.where("label = 1").count()
+    negative_sampled = sampled.where("label = 0").count()
+
+    assert positive_sampled == positive_original
+    assert negative_sampled <= positive_original + 2
+
+
+def test_select_prediction_threshold_prefers_best_dice_and_lower_fp_burden(spark_session):
+    rows = [
+        _rich_feature_row(
+            t1=1.0,
+            flair=2.0,
+            spatial_prior=0.2,
+            label=1,
+            probability=Vectors.dense([0.2, 0.8]),
+        ),
+        _rich_feature_row(
+            t1=1.0,
+            flair=2.0,
+            spatial_prior=0.2,
+            label=0,
+            probability=Vectors.dense([0.45, 0.55]),
+        ),
+        _rich_feature_row(
+            t1=1.0,
+            flair=2.0,
+            spatial_prior=0.2,
+            label=0,
+            probability=Vectors.dense([0.6, 0.4]),
+        ),
+    ]
+    df = spark_session.createDataFrame(rows)
+    config = ClassificationConfig(candidate_thresholds=(0.4, 0.6))
+
+    selection = select_prediction_threshold(append_probability_column(_StaticProbabilityModel(), df, config), config)
+
+    assert selection.threshold == pytest.approx(0.6)
+    assert selection.dsc == pytest.approx(1.0)

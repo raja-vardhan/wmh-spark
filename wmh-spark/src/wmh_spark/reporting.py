@@ -40,6 +40,9 @@ class SubjectMetrics:
     raw_predicted_voxels: Optional[int] = None
     max_wmh_probability: Optional[float] = None
     prediction_threshold: Optional[float] = None
+    false_positive_voxels: Optional[int] = None
+    false_negative_voxels: Optional[int] = None
+    predicted_reference_ratio: Optional[float] = None
 
     def to_dict(self) -> dict:
         return {
@@ -56,6 +59,9 @@ class SubjectMetrics:
             "voxel_volume_mm3": self.voxel_volume_mm3,
             "max_wmh_probability": self.max_wmh_probability,
             "prediction_threshold": self.prediction_threshold,
+            "false_positive_voxels": self.false_positive_voxels,
+            "false_negative_voxels": self.false_negative_voxels,
+            "predicted_reference_ratio": self.predicted_reference_ratio,
         }
 
 
@@ -160,9 +166,12 @@ _SUBJECT_HTML = """<!doctype html>
   <tr><td>Raw predicted lesion voxels</td><td>{raw_pv}</td></tr>
   <tr><td>Predicted lesion voxels</td><td>{pv:,}</td></tr>
   <tr><td>Reference lesion voxels</td><td>{rv}</td></tr>
+  <tr><td>False-positive voxels</td><td>{fpv}</td></tr>
+  <tr><td>False-negative voxels</td><td>{fnv}</td></tr>
   <tr><td>Predicted lesion clusters</td><td>{lc}</td></tr>
   <tr><td>Predicted volume (mm³)</td><td>{pvol:,.1f}</td></tr>
   <tr><td>Reference volume (mm³)</td><td>{rvol}</td></tr>
+  <tr><td>Predicted/reference volume ratio</td><td>{vol_ratio}</td></tr>
   <tr><td>Max WMH probability</td><td>{max_prob}</td></tr>
   <tr><td>Prediction threshold</td><td>{pred_threshold}</td></tr>
 </table>
@@ -190,9 +199,12 @@ def write_subject_report(metrics: SubjectMetrics, out_dir: Path) -> Path:
             raw_pv=_fmt_optional(metrics.raw_predicted_voxels, ",d"),
             pv=metrics.predicted_voxels,
             rv=_fmt_optional(metrics.reference_voxels, ",d"),
+            fpv=_fmt_optional(metrics.false_positive_voxels, ",d"),
+            fnv=_fmt_optional(metrics.false_negative_voxels, ",d"),
             lc=metrics.lesion_count,
             pvol=metrics.predicted_volume_mm3,
             rvol=_fmt_optional(metrics.reference_volume_mm3, ",.1f"),
+            vol_ratio=_fmt_optional(metrics.predicted_reference_ratio, ".4f"),
             max_prob=_fmt_optional(metrics.max_wmh_probability, ".4f"),
             pred_threshold=_fmt_optional(metrics.prediction_threshold, ".4f"),
         )
@@ -204,6 +216,7 @@ def write_aggregate_report(
     metrics: List[SubjectMetrics],
     out_dir: Path,
     per_subject_subdir: str = "../per_subject",
+    baseline_summaries: Optional[List[dict]] = None,
 ) -> Path:
     """Write CSV + per-site DSC chart + volume scatter + index HTML."""
     if not metrics:
@@ -270,9 +283,13 @@ def write_aggregate_report(
             f"<td>{m.lesion_count}</td>"
             f"<td>{m.predicted_volume_mm3:,.1f}</td>"
             f"<td>{_fmt_optional(m.reference_volume_mm3, ',.1f')}</td>"
+            f"<td>{_fmt_optional(m.false_positive_voxels, ',d')}</td>"
+            f"<td>{_fmt_optional(m.false_negative_voxels, ',d')}</td>"
+            f"<td>{_fmt_optional(m.predicted_reference_ratio, '.4f')}</td>"
             "</tr>"
         )
     summary = _summary_block(metrics)
+    baseline_table = _baseline_table(baseline_summaries or [])
     images = _images_block(out_dir)
     html_path = out_dir / "report.html"
     html_path.write_text(
@@ -290,12 +307,14 @@ def write_aggregate_report(
 </style></head><body>
 <h1>WMH pipeline run — aggregate report</h1>
 {summary}
+{baseline_table}
 <h2>Plots</h2>
 <div class="images">{images}</div>
 <h2>Per-subject results</h2>
 <table>
   <tr><th>Subject</th><th>Site</th><th>Dice</th><th>Raw voxels</th><th>Lesions</th>
-      <th>Predicted vol (mm³)</th><th>Reference vol (mm³)</th></tr>
+      <th>Predicted vol (mm³)</th><th>Reference vol (mm³)</th>
+      <th>FP voxels</th><th>FN voxels</th><th>Volume ratio</th></tr>
   {''.join(rows)}
 </table>
 </body></html>
@@ -314,12 +333,19 @@ def _csv_cell(value) -> str:
 
 def _summary_block(metrics: List[SubjectMetrics]) -> str:
     dsc_values = [m.dsc for m in metrics if m.dsc is not None]
+    volume_ratios = [m.predicted_reference_ratio for m in metrics if m.predicted_reference_ratio is not None]
     lines = [f"<p>Subjects: <b>{len(metrics)}</b></p>"]
     if dsc_values:
         lines.append(
             f"<p>Mean Dice: <b>{np.mean(dsc_values):.4f}</b> "
             f"(median {np.median(dsc_values):.4f}, "
             f"min {min(dsc_values):.4f}, max {max(dsc_values):.4f})</p>"
+        )
+    if volume_ratios:
+        lines.append(
+            f"<p>Predicted/reference volume ratio: "
+            f"<b>{np.mean(volume_ratios):.4f}</b> "
+            f"(median {np.median(volume_ratios):.4f})</p>"
         )
     return "".join(lines)
 
@@ -330,6 +356,35 @@ def _images_block(out_dir: Path) -> str:
         if (out_dir / name).exists():
             parts.append(f"<img src='{name}' alt='{name}'>")
     return "".join(parts)
+
+
+def _baseline_table(baselines: List[dict]) -> str:
+    if not baselines:
+        return ""
+    rows = []
+    for baseline in baselines:
+        rows.append(
+            "<tr>"
+            f"<td>{baseline.get('name', 'baseline')}</td>"
+            f"<td>{_fmt_optional(baseline.get('mean_dsc'), '.4f')}</td>"
+            f"<td>{_fmt_optional(baseline.get('median_dsc'), '.4f')}</td>"
+            f"<td>{_fmt_optional(baseline.get('mean_predicted_reference_ratio'), '.4f')}</td>"
+            f"<td>{_fmt_optional(baseline.get('mean_false_positive_voxels'), '.0f')}</td>"
+            f"<td>{_fmt_optional(baseline.get('mean_false_negative_voxels'), '.0f')}</td>"
+            f"<td>{baseline.get('model_wins', '—')}</td>"
+            f"<td>{baseline.get('baseline_wins', '—')}</td>"
+            f"<td>{baseline.get('ties', '—')}</td>"
+            "</tr>"
+        )
+    return (
+        "<h2>Baseline comparison</h2>"
+        "<table>"
+        "<tr><th>Baseline</th><th>Mean Dice</th><th>Median Dice</th>"
+        "<th>Mean volume ratio</th><th>Mean FP voxels</th><th>Mean FN voxels</th>"
+        "<th>Model wins</th><th>Baseline wins</th><th>Ties</th></tr>"
+        f"{''.join(rows)}"
+        "</table>"
+    )
 
 
 def count_lesions(mask: np.ndarray) -> int:

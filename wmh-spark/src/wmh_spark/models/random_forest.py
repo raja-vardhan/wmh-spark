@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Sequence
 
@@ -12,13 +13,16 @@ from pyspark.ml.feature import VectorAssembler
 from pyspark.ml.functions import vector_to_array
 from pyspark.sql import functions as F
 
+from wmh_spark.evaluation.metrics import EvaluationConfig, calculate_dice_result
+from wmh_spark.feature_extraction import RICH_FEATURE_COLUMNS
+
 if TYPE_CHECKING:
     from pyspark.ml import PipelineModel
     from pyspark.sql import DataFrame
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_FEATURE_COLUMNS = ("t1", "flair", "t1_flair_ratio", "spatial_prior")
+DEFAULT_FEATURE_COLUMNS = RICH_FEATURE_COLUMNS
 
 
 @dataclass(frozen=True)
@@ -26,6 +30,7 @@ class ClassificationConfig:
     """Reproducible settings for the Spark MLlib Random Forest classifier."""
 
     feature_columns: Sequence[str] = field(default_factory=lambda: DEFAULT_FEATURE_COLUMNS)
+    feature_set: str = "rich"
     label_column: str = "label"
     features_column: str = "features"
     prediction_column: str = "prediction"
@@ -42,6 +47,12 @@ class ClassificationConfig:
     subsampling_rate: float = 1.0
     prediction_threshold: float = 0.25
     positive_class_weight_cap: float = 100.0
+    negative_sampling_ratio: float = 0.0
+    use_class_weights: bool = True
+    candidate_thresholds: Sequence[float] = field(
+        default_factory=lambda: (0.15, 0.25, 0.35, 0.5, 0.65)
+    )
+    model_type: str = "random_forest"
 
 
 @dataclass(frozen=True)
@@ -57,6 +68,26 @@ class ClassBalanceStats:
             "negative_count": self.negative_count,
             "positive_count": self.positive_count,
             "positive_class_weight": self.positive_class_weight,
+        }
+
+
+@dataclass(frozen=True)
+class ThresholdSelectionResult:
+    """Validation result for a single probability threshold."""
+
+    threshold: float
+    dsc: float
+    predicted_positive: int
+    reference_positive: int
+    intersection: int
+
+    def to_dict(self) -> dict:
+        return {
+            "threshold": self.threshold,
+            "dsc": self.dsc,
+            "predicted_positive": self.predicted_positive,
+            "reference_positive": self.reference_positive,
+            "intersection": self.intersection,
         }
 
 
@@ -109,6 +140,20 @@ def _validate_weight_cap(config: ClassificationConfig) -> None:
         raise ValueError("positive_class_weight_cap must be positive")
 
 
+def _validate_negative_sampling_ratio(config: ClassificationConfig) -> None:
+    if config.negative_sampling_ratio < 0:
+        raise ValueError("negative_sampling_ratio must be non-negative")
+
+
+def _validate_candidate_thresholds(config: ClassificationConfig) -> None:
+    thresholds = tuple(config.candidate_thresholds)
+    if not thresholds:
+        raise ValueError("candidate_thresholds must not be empty")
+    invalid = [threshold for threshold in thresholds if not 0.0 <= float(threshold) <= 1.0]
+    if invalid:
+        raise ValueError(f"candidate_thresholds must be between 0 and 1; found {invalid}")
+
+
 def _assembler(config: ClassificationConfig) -> VectorAssembler:
     return VectorAssembler(
         inputCols=list(config.feature_columns),
@@ -155,6 +200,8 @@ def add_class_weight_column(
     stats: ClassBalanceStats | None = None,
 ) -> "DataFrame":
     """Append the configured RF weight column for imbalanced WMH training."""
+    if not config.use_class_weights:
+        return df.withColumn(config.weight_column, F.lit(1.0))
     stats = stats or calculate_class_balance_stats(df, config)
     return df.withColumn(
         config.weight_column,
@@ -163,6 +210,39 @@ def add_class_weight_column(
             F.lit(float(stats.positive_class_weight)),
         ).otherwise(F.lit(1.0)),
     )
+
+
+def downsample_negative_examples(
+    df: "DataFrame",
+    config: ClassificationConfig,
+    stats: ClassBalanceStats | None = None,
+) -> "DataFrame":
+    """Optionally subsample negative voxels to focus training on lesion candidates."""
+    _validate_negative_sampling_ratio(config)
+    if config.negative_sampling_ratio <= 0:
+        return df
+
+    stats = stats or calculate_class_balance_stats(df, config)
+    desired_negative = int(math.ceil(stats.positive_count * float(config.negative_sampling_ratio)))
+    if desired_negative <= 0 or desired_negative >= stats.negative_count:
+        return df
+
+    negative_fraction = desired_negative / float(stats.negative_count)
+    label = F.col(config.label_column).cast("int")
+    positives = df.where(label == F.lit(1))
+    negatives = df.where(label == F.lit(0)).sample(
+        withReplacement=False,
+        fraction=negative_fraction,
+        seed=config.seed,
+    )
+    logger.info(
+        "downsampling negatives: ratio=%.3f original_negative=%d desired_negative=%d fraction=%.4f",
+        config.negative_sampling_ratio,
+        stats.negative_count,
+        desired_negative,
+        negative_fraction,
+    )
+    return positives.unionByName(negatives)
 
 
 def prepare_training_dataframe(
@@ -177,7 +257,9 @@ def prepare_training_dataframe(
     spark = df.sparkSession
     spark.conf.set("spark.sql.shuffle.partitions", str(config.training_partitions))
 
-    prepared = _assembler(config).transform(add_class_weight_column(df, config))
+    sampled = downsample_negative_examples(df, config)
+    stats = calculate_class_balance_stats(sampled, config)
+    prepared = _assembler(config).transform(add_class_weight_column(sampled, config, stats))
     return (
         prepared
         # Repartition to the classifier plan so Spark ML tree training has work
@@ -195,14 +277,16 @@ def train_random_forest_model(
     config = config or ClassificationConfig()
     _validate_training_partitions(config)
     _validate_probability_threshold(config)
+    _validate_negative_sampling_ratio(config)
     validate_feature_columns(df, config, require_label=True)
     validate_binary_labels(df, config)
-    balance_stats = balance_stats or calculate_class_balance_stats(df, config)
+    training_source = downsample_negative_examples(df, config, balance_stats)
+    balance_stats = balance_stats or calculate_class_balance_stats(training_source, config)
 
     spark = df.sparkSession
     spark.conf.set("spark.sql.shuffle.partitions", str(config.training_partitions))
     training_df = (
-        add_class_weight_column(df, config, balance_stats)
+        add_class_weight_column(training_source, config, balance_stats)
         # Repartition to the classifier plan so RandomForestClassifier can train
         # over distributed partitions instead of a collapsed local table.
         .repartition(config.training_partitions)
@@ -237,14 +321,13 @@ def train_random_forest_model(
     return pipeline.fit(training_df)
 
 
-def predict_voxel_mask(
+def append_probability_column(
     model: "PipelineModel",
     df: "DataFrame",
     config: ClassificationConfig | None = None,
 ) -> "DataFrame":
-    """Apply a trained model and append an integer raw binary voxel mask column."""
+    """Apply a trained model and append the positive-class probability column."""
     config = config or ClassificationConfig()
-    _validate_probability_threshold(config)
     validate_feature_columns(df, config, require_label=False)
 
     predicted = model.transform(df)
@@ -254,11 +337,85 @@ def predict_voxel_mask(
             config.positive_probability_column,
             positive_probability.cast("double"),
         )
-        .withColumn(
-            config.mask_column,
-            (
-                F.col(config.positive_probability_column)
-                >= F.lit(float(config.prediction_threshold))
-            ).cast("int"),
-        )
     )
+
+
+def apply_probability_threshold(
+    df: "DataFrame",
+    config: ClassificationConfig | None = None,
+    threshold: float | None = None,
+) -> "DataFrame":
+    """Append an integer prediction mask column from the positive-class probability."""
+    config = config or ClassificationConfig()
+    resolved_threshold = float(config.prediction_threshold if threshold is None else threshold)
+    if not 0.0 <= resolved_threshold <= 1.0:
+        raise ValueError("threshold must be between 0 and 1")
+    if config.positive_probability_column not in df.columns:
+        raise ValueError(
+            f"missing required probability column: {config.positive_probability_column}"
+        )
+    return df.withColumn(
+        config.mask_column,
+        (
+            F.col(config.positive_probability_column)
+            >= F.lit(resolved_threshold)
+        ).cast("int"),
+    )
+
+
+def predict_voxel_mask(
+    model: "PipelineModel",
+    df: "DataFrame",
+    config: ClassificationConfig | None = None,
+) -> "DataFrame":
+    """Apply a trained model and append an integer raw binary voxel mask column."""
+    config = config or ClassificationConfig()
+    _validate_probability_threshold(config)
+    predicted = append_probability_column(model, df, config)
+    return apply_probability_threshold(predicted, config)
+
+
+def select_prediction_threshold(
+    probability_df: "DataFrame",
+    config: ClassificationConfig | None = None,
+) -> ThresholdSelectionResult:
+    """Choose the validation threshold with the highest Dice score."""
+    config = config or ClassificationConfig()
+    _validate_candidate_thresholds(config)
+    if config.label_column not in probability_df.columns:
+        raise ValueError(f"missing required label column: {config.label_column}")
+    if config.positive_probability_column not in probability_df.columns:
+        raise ValueError(
+            f"missing required probability column: {config.positive_probability_column}"
+        )
+
+    best: ThresholdSelectionResult | None = None
+    candidate_thresholds = sorted({float(t) for t in config.candidate_thresholds} | {float(config.prediction_threshold)})
+    eval_config = EvaluationConfig(
+        prediction_column=config.mask_column,
+        label_column=config.label_column,
+        dsc_threshold=0.0,
+    )
+    for threshold in candidate_thresholds:
+        thresholded = apply_probability_threshold(probability_df, config, threshold)
+        result = calculate_dice_result(thresholded, eval_config)
+        candidate = ThresholdSelectionResult(
+            threshold=float(threshold),
+            dsc=float(result.dsc),
+            predicted_positive=result.predicted_positive,
+            reference_positive=result.reference_positive,
+            intersection=result.intersection,
+        )
+        if best is None:
+            best = candidate
+            continue
+        if candidate.dsc > best.dsc:
+            best = candidate
+            continue
+        if math.isclose(candidate.dsc, best.dsc, rel_tol=0.0, abs_tol=1e-9):
+            if candidate.predicted_positive < best.predicted_positive:
+                best = candidate
+
+    if best is None:
+        raise ValueError("no threshold candidates available")
+    return best

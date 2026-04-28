@@ -10,9 +10,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Sequence
 
 import numpy as np
+from scipy import ndimage
 from pyspark.sql import functions as F
 
-from wmh_spark.io_utils import build_voxel_dataframe, load_volume, validate_subject_volumes
+from wmh_spark.io_utils import load_volume, validate_binary_mask, validate_subject_volumes
 
 if TYPE_CHECKING:
     from pyspark.sql import DataFrame, SparkSession
@@ -23,6 +24,26 @@ DEFAULT_FEATURE_BYTES_PER_ROW = 48
 DEFAULT_TARGET_PARTITION_BYTES = 256 * 1024**2
 DEFAULT_MAX_PARTITION_BYTES = 16 * 1024**3
 DEFAULT_MIN_FEATURE_PARTITIONS = 4
+DEFAULT_LOCAL_WINDOW_SIZE = 3
+
+BASELINE_FEATURE_COLUMNS = ("t1", "flair", "t1_flair_ratio", "spatial_prior")
+RICH_FEATURE_COLUMNS = (
+    *BASELINE_FEATURE_COLUMNS,
+    "t1_zscore",
+    "flair_zscore",
+    "t1_local_mean",
+    "t1_local_std",
+    "flair_local_mean",
+    "flair_local_std",
+    "x_norm",
+    "y_norm",
+    "z_norm",
+    "distance_to_center",
+)
+FEATURE_SETS = {
+    "baseline": BASELINE_FEATURE_COLUMNS,
+    "rich": RICH_FEATURE_COLUMNS,
+}
 
 
 @dataclass(frozen=True)
@@ -185,6 +206,85 @@ def add_t1_flair_ratio(
     )
 
 
+def resolve_feature_columns(feature_set: str) -> tuple[str, ...]:
+    """Resolve a named feature set to the concrete ordered column tuple."""
+    try:
+        return FEATURE_SETS[feature_set]
+    except KeyError as exc:
+        known = ", ".join(sorted(FEATURE_SETS))
+        raise ValueError(f"unknown feature_set={feature_set!r}; expected one of: {known}") from exc
+
+
+def _brain_mask(t1: np.ndarray, flair: np.ndarray) -> np.ndarray:
+    return ((np.abs(t1) > 1e-6) | (np.abs(flair) > 1e-6)).astype(np.uint8)
+
+
+def _safe_zscore(volume: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    masked = volume[mask > 0]
+    if masked.size == 0:
+        return np.zeros(volume.shape, dtype=np.float32)
+    mean = float(masked.mean())
+    std = float(masked.std())
+    if std <= 1e-6:
+        return np.zeros(volume.shape, dtype=np.float32)
+    standardized = (volume - mean) / std
+    standardized = standardized.astype(np.float32, copy=False)
+    standardized[mask == 0] = 0.0
+    return standardized
+
+
+def _local_mean_std(
+    volume: np.ndarray,
+    mask: np.ndarray,
+    window_size: int = DEFAULT_LOCAL_WINDOW_SIZE,
+) -> tuple[np.ndarray, np.ndarray]:
+    if window_size <= 0 or window_size % 2 == 0:
+        raise ValueError("window_size must be a positive odd integer")
+
+    kernel = np.ones((window_size, window_size, window_size), dtype=np.float32)
+    masked_volume = volume * mask
+    voxel_counts = ndimage.convolve(mask.astype(np.float32), kernel, mode="constant", cval=0.0)
+    voxel_sums = ndimage.convolve(masked_volume.astype(np.float32), kernel, mode="constant", cval=0.0)
+    voxel_sq_sums = ndimage.convolve(
+        np.square(masked_volume, dtype=np.float32),
+        kernel,
+        mode="constant",
+        cval=0.0,
+    )
+
+    mean = np.zeros(volume.shape, dtype=np.float32)
+    std = np.zeros(volume.shape, dtype=np.float32)
+    valid = voxel_counts > 0
+    mean[valid] = voxel_sums[valid] / voxel_counts[valid]
+    variance = np.zeros(volume.shape, dtype=np.float32)
+    variance[valid] = (voxel_sq_sums[valid] / voxel_counts[valid]) - np.square(mean[valid])
+    variance = np.clip(variance, a_min=0.0, a_max=None)
+    std[valid] = np.sqrt(variance[valid], dtype=np.float32)
+    mean[mask == 0] = 0.0
+    std[mask == 0] = 0.0
+    return mean, std
+
+
+def _normalized_coordinate_grids(shape: Sequence[int]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    z_idx, y_idx, x_idx = np.indices(shape, dtype=np.float32)
+    z_den = max(shape[0] - 1, 1)
+    y_den = max(shape[1] - 1, 1)
+    x_den = max(shape[2] - 1, 1)
+    return (
+        z_idx / float(z_den),
+        y_idx / float(y_den),
+        x_idx / float(x_den),
+    )
+
+
+def _distance_to_center(z_norm: np.ndarray, y_norm: np.ndarray, x_norm: np.ndarray) -> np.ndarray:
+    distance = np.sqrt(
+        np.square(z_norm - 0.5) + np.square(y_norm - 0.5) + np.square(x_norm - 0.5)
+    )
+    max_distance = float(np.sqrt(3.0) / 2.0)
+    return (distance / max_distance).astype(np.float32)
+
+
 def build_feature_dataframe(
     spark: "SparkSession",
     subject_id: str,
@@ -201,8 +301,10 @@ def build_feature_dataframe(
     Output columns:
         subject_id, x, y, z, t1, flair, t1_flair_ratio, spatial_prior [, label]
     """
+    import pandas as pd
+
     t0 = time.time()
-    t1, _, subject_affine = validate_subject_volumes(t1_path, flair_path)
+    t1, flair, subject_affine = validate_subject_volumes(t1_path, flair_path)
     spatial_prior = validate_spatial_prior_template(
         subject_shape=t1.shape,
         subject_affine=subject_affine,
@@ -215,36 +317,48 @@ def build_feature_dataframe(
     )
     spark.conf.set("spark.sql.shuffle.partitions", str(plan.partition_count))
 
-    voxel_df = build_voxel_dataframe(
-        spark=spark,
-        subject_id=subject_id,
-        t1_path=t1_path,
-        flair_path=flair_path,
-        partition_count=plan.partition_count,
-        mask_path=mask_path,
-    )
-    ratio_df = add_t1_flair_ratio(voxel_df, ratio_epsilon=ratio_epsilon)
-    prior_df = _spatial_prior_array_to_dataframe(
-        spark=spark,
-        spatial_prior=spatial_prior,
-        partition_count=plan.partition_count,
-    )
-    joined = ratio_df.join(F.broadcast(prior_df), on=["x", "y", "z"], how="left")
+    label_col: Optional[np.ndarray] = None
+    if mask_path is not None:
+        label_col = validate_binary_mask(mask_path).ravel().astype(np.int32)
 
-    ordered_columns = [
-        "subject_id",
-        "x",
-        "y",
-        "z",
-        "t1",
-        "flair",
-        "t1_flair_ratio",
-        "spatial_prior",
-    ]
-    if "label" in joined.columns:
-        ordered_columns.append("label")
+    mask = _brain_mask(t1, flair)
+    t1_zscore = _safe_zscore(t1, mask)
+    flair_zscore = _safe_zscore(flair, mask)
+    t1_local_mean, t1_local_std = _local_mean_std(t1, mask)
+    flair_local_mean, flair_local_std = _local_mean_std(flair, mask)
+    z_norm, y_norm, x_norm = _normalized_coordinate_grids(t1.shape)
+    center_distance = _distance_to_center(z_norm, y_norm, x_norm)
+    ratio = np.zeros(t1.shape, dtype=np.float32)
+    valid_ratio = np.abs(flair) > float(ratio_epsilon)
+    ratio[valid_ratio] = (t1[valid_ratio] / flair[valid_ratio]).astype(np.float32, copy=False)
 
-    result = joined.select(*ordered_columns)
+    z_idx, y_idx, x_idx = np.indices(t1.shape, dtype=np.int32)
+    pdf = pd.DataFrame(
+        {
+            "subject_id": subject_id,
+            "x": x_idx.ravel(),
+            "y": y_idx.ravel(),
+            "z": z_idx.ravel(),
+            "t1": t1.ravel(),
+            "flair": flair.ravel(),
+            "t1_flair_ratio": ratio.ravel(),
+            "spatial_prior": spatial_prior.ravel().astype(np.float32),
+            "t1_zscore": t1_zscore.ravel(),
+            "flair_zscore": flair_zscore.ravel(),
+            "t1_local_mean": t1_local_mean.ravel(),
+            "t1_local_std": t1_local_std.ravel(),
+            "flair_local_mean": flair_local_mean.ravel(),
+            "flair_local_std": flair_local_std.ravel(),
+            "x_norm": x_norm.ravel(),
+            "y_norm": y_norm.ravel(),
+            "z_norm": z_norm.ravel(),
+            "distance_to_center": center_distance.ravel(),
+        }
+    )
+    if label_col is not None:
+        pdf["label"] = label_col
+
+    result = spark.createDataFrame(pdf).repartition(plan.partition_count)
     logger.info(
         "build_feature_dataframe: subject=%s voxels=%d partitions=%d elapsed=%.2fs",
         subject_id,

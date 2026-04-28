@@ -48,6 +48,16 @@ def test_build_feature_dataframe_schema_ratio_and_spatial_prior(
         "flair",
         "t1_flair_ratio",
         "spatial_prior",
+        "t1_zscore",
+        "flair_zscore",
+        "t1_local_mean",
+        "t1_local_std",
+        "flair_local_mean",
+        "flair_local_std",
+        "x_norm",
+        "y_norm",
+        "z_norm",
+        "distance_to_center",
     ]:
         assert column in df.columns
     assert df.count() == np.prod(synthetic_volume_shape)
@@ -58,7 +68,18 @@ def test_build_feature_dataframe_schema_ratio_and_spatial_prior(
 
     row = (
         df.where((F.col("x") == x) & (F.col("y") == y) & (F.col("z") == z))
-        .select("t1", "flair", "t1_flair_ratio", "spatial_prior")
+        .select(
+            "t1",
+            "flair",
+            "t1_flair_ratio",
+            "spatial_prior",
+            "t1_zscore",
+            "flair_zscore",
+            "x_norm",
+            "y_norm",
+            "z_norm",
+            "distance_to_center",
+        )
         .first()
     )
 
@@ -69,6 +90,12 @@ def test_build_feature_dataframe_schema_ratio_and_spatial_prior(
         rel=1e-6,
     )
     assert row["spatial_prior"] == pytest.approx(float(prior[z, y, x]), rel=1e-6)
+    assert 0.0 <= row["x_norm"] <= 1.0
+    assert 0.0 <= row["y_norm"] <= 1.0
+    assert 0.0 <= row["z_norm"] <= 1.0
+    assert 0.0 <= row["distance_to_center"] <= 1.0
+    assert np.isfinite(row["t1_zscore"])
+    assert np.isfinite(row["flair_zscore"])
 
 
 def test_feature_ratio_uses_spark_expression_not_python_udf(

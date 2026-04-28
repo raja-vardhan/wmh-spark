@@ -33,6 +33,26 @@ def _prediction_df(spark_session, shape, positive_coords):
     return spark_session.createDataFrame(rows).repartition(2)
 
 
+def _prediction_df_with_probability(spark_session, shape, probabilities):
+    rows = []
+    for z in range(shape[0]):
+        for y in range(shape[1]):
+            for x in range(shape[2]):
+                probability = probabilities.get((z, y, x), 0.0)
+                rows.append(
+                    {
+                        "subject_id": "subj",
+                        "x": x,
+                        "y": y,
+                        "z": z,
+                        "predicted_mask": 1 if probability > 0 else 0,
+                        "wmh_probability": float(probability),
+                        "spatial_prior": 0.8 if probability > 0 else 0.1,
+                    }
+                )
+    return spark_session.createDataFrame(rows).repartition(2)
+
+
 def test_reconstruct_prediction_volume_from_flat_dataframe(spark_session):
     shape = (3, 4, 5)
     positives = {(0, 1, 2), (2, 3, 4)}
@@ -112,3 +132,30 @@ def test_postprocess_predictions_requires_prediction_column(spark_session):
 
     with pytest.raises(ValueError, match="predicted_mask"):
         postprocess_predictions(df, PostProcessingConfig(volume_shape=(1, 1, 1)))
+
+
+def test_postprocess_predictions_filters_low_confidence_components(spark_session):
+    shape = (3, 3, 3)
+    probabilities = {
+        (0, 0, 0): 0.9,
+        (0, 0, 1): 0.9,
+        (2, 2, 2): 0.2,
+        (2, 2, 1): 0.2,
+    }
+    df = _prediction_df_with_probability(spark_session, shape, probabilities)
+
+    result = postprocess_predictions(
+        df,
+        PostProcessingConfig(
+            volume_shape=shape,
+            min_cluster_size=2,
+            min_component_mean_probability=0.5,
+            min_component_peak_probability=0.5,
+        ),
+    )
+
+    kept = {
+        (row["z"], row["y"], row["x"])
+        for row in result.where(F.col("postprocessed_mask") == 1).select("z", "y", "x").collect()
+    }
+    assert kept == {(0, 0, 0), (0, 0, 1)}
