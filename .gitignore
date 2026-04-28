@@ -31,7 +31,7 @@ spark-warehouse/
 
 # Data (large files – use Git LFS or keep out of repo)
 
-wmh-spark/data/
+
 *.parquet
 *.jsonl
 

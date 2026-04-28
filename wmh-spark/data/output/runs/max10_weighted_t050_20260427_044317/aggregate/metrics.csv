@@ -1,0 +1,6 @@
+subject_id,site,dsc,raw_predicted_voxels,predicted_voxels,reference_voxels,intersection,lesion_count,predicted_volume_mm3,reference_volume_mm3,voxel_volume_mm3,max_wmh_probability,prediction_threshold
+Amsterdam_GE3T_111,Amsterdam,0.35567,29151,25147,6281,5589,91,88410.8,22082.5,3.51576,0.985355,0.5
+Singapore_70,Singapore,0.0578811,68892,66513,2456,1996,92,199539,7368,3,0.985355,0.5
+Amsterdam_GE3T_117,Amsterdam,0.503263,7487,5503,13342,4742,25,19347.2,46907.3,3.51576,0.985355,0.5
+Singapore_71,Singapore,0.261705,47051,43854,8281,6822,161,131562,24843,3,0.985355,0.5
+Amsterdam_GE3T_118,Amsterdam,0.0484835,21722,17381,687,438,144,61107.4,2415.33,3.51576,0.985355,0.5

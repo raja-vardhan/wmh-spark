@@ -1,0 +1,73 @@
+{
+  "subjects_train": 10,
+  "subjects_model_train": 8,
+  "subjects_validation": 2,
+  "subjects_test": 10,
+  "mean_dsc": 0.30822481323582207,
+  "total_elapsed_seconds": 8301.1,
+  "feature_set": "rich",
+  "rf_num_trees": 20,
+  "rf_max_depth": 8,
+  "negative_sampling_ratio": 5.0,
+  "min_cluster_size": 10,
+  "min_component_mean_probability": 0.0,
+  "min_component_peak_probability": 0.0,
+  "anatomical_gate_enabled": false,
+  "min_component_mean_spatial_prior": 0.0,
+  "prediction_threshold": 0.65,
+  "candidate_thresholds": [
+    0.15,
+    0.25,
+    0.35,
+    0.5,
+    0.65
+  ],
+  "validation_threshold_selection": {
+    "threshold": 0.65,
+    "dsc": 0.41754830812275945,
+    "predicted_positive": 28321,
+    "reference_positive": 17427,
+    "intersection": 9551
+  },
+  "spatial_prior_baseline_threshold": 0.5,
+  "baseline_summaries": [
+    {
+      "name": "all_zero",
+      "mean_dsc": 0.0,
+      "median_dsc": 0.0,
+      "mean_predicted_reference_ratio": 0.0,
+      "mean_false_positive_voxels": 0.0,
+      "mean_false_negative_voxels": 7216.5,
+      "model_wins": 10,
+      "baseline_wins": 0,
+      "ties": 0
+    },
+    {
+      "name": "all_positive",
+      "mean_dsc": 0.005072933249828845,
+      "median_dsc": 0.0030951887966723783,
+      "mean_predicted_reference_ratio": 2043.379107963739,
+      "mean_false_positive_voxels": 2820559.5,
+      "mean_false_negative_voxels": 0.0,
+      "model_wins": 10,
+      "baseline_wins": 0,
+      "ties": 0
+    },
+    {
+      "name": "spatial_prior_only",
+      "mean_dsc": 0.04976039850972002,
+      "median_dsc": 0.032148285945402554,
+      "mean_predicted_reference_ratio": 3.190899396286649,
+      "mean_false_positive_voxels": 3683.0,
+      "mean_false_negative_voxels": 6809.2,
+      "model_wins": 10,
+      "baseline_wins": 0,
+      "ties": 0
+    }
+  ],
+  "class_weighting": true,
+  "positive_class_weight": 100.0,
+  "positive_class_weight_cap": 100.0,
+  "training_positive_count": 38421,
+  "training_negative_count": 28239339
+}

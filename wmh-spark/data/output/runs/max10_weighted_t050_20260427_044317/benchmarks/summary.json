@@ -1,0 +1,15 @@
+{
+  "subjects_train": 5,
+  "subjects_test": 5,
+  "mean_dsc": 0.24540066808276548,
+  "total_elapsed_seconds": 2172.43,
+  "rf_num_trees": 20,
+  "rf_max_depth": 8,
+  "min_cluster_size": 10,
+  "prediction_threshold": 0.5,
+  "class_weighting": true,
+  "positive_class_weight": 100.0,
+  "positive_class_weight_cap": 100.0,
+  "training_positive_count": 21335,
+  "training_negative_count": 14094505
+}

@@ -1,0 +1,15 @@
+{
+  "subject_id": "Singapore_70",
+  "site": "Singapore",
+  "dsc": 0.057881077005611216,
+  "raw_predicted_voxels": 68892,
+  "predicted_voxels": 66513,
+  "reference_voxels": 2456,
+  "intersection": 1996,
+  "lesion_count": 92,
+  "predicted_volume_mm3": 199539.0124035308,
+  "reference_volume_mm3": 7368.0004580017685,
+  "voxel_volume_mm3": 3.0000001864828048,
+  "max_wmh_probability": 0.985354705971299,
+  "prediction_threshold": 0.5
+}

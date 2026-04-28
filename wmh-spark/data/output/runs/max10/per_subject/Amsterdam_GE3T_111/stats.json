@@ -1,0 +1,12 @@
+{
+  "subject_id": "Amsterdam_GE3T_111",
+  "site": "Amsterdam",
+  "dsc": 0.0,
+  "predicted_voxels": 0,
+  "reference_voxels": 6281,
+  "intersection": 0,
+  "lesion_count": 0,
+  "predicted_volume_mm3": 0.0,
+  "reference_volume_mm3": 22082.48789348948,
+  "voxel_volume_mm3": 3.515759893884649
+}

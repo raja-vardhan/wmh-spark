@@ -1,0 +1,9 @@
+{
+  "subjects_train": 5,
+  "subjects_test": 5,
+  "mean_dsc": 0.0,
+  "total_elapsed_seconds": 3302.53,
+  "rf_num_trees": 20,
+  "rf_max_depth": 8,
+  "min_cluster_size": 10
+}

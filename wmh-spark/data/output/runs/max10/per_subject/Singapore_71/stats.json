@@ -1,0 +1,12 @@
+{
+  "subject_id": "Singapore_71",
+  "site": "Singapore",
+  "dsc": 0.0,
+  "predicted_voxels": 0,
+  "reference_voxels": 8281,
+  "intersection": 0,
+  "lesion_count": 0,
+  "predicted_volume_mm3": 0.0,
+  "reference_volume_mm3": 24842.98017437449,
+  "voxel_volume_mm3": 2.9999976058899276
+}

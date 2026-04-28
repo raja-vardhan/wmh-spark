@@ -1,0 +1,15 @@
+{
+  "subject_id": "Amsterdam_GE3T_118",
+  "site": "Amsterdam",
+  "dsc": 0.026809399722985187,
+  "raw_predicted_voxels": 46422,
+  "predicted_voxels": 41910,
+  "reference_voxels": 687,
+  "intersection": 571,
+  "lesion_count": 145,
+  "predicted_volume_mm3": 147345.49715270565,
+  "reference_volume_mm3": 2415.327047098754,
+  "voxel_volume_mm3": 3.515759893884649,
+  "max_wmh_probability": 0.985354705971299,
+  "prediction_threshold": 0.25
+}

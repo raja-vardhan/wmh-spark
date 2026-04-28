@@ -1,0 +1,6 @@
+subject_id,site,dsc,predicted_voxels,reference_voxels,intersection,lesion_count,predicted_volume_mm3,reference_volume_mm3,voxel_volume_mm3
+Amsterdam_GE3T_111,Amsterdam,0,0,6281,0,0,0,22082.5,3.51576
+Singapore_70,Singapore,0,0,2456,0,0,0,7368,3
+Amsterdam_GE3T_117,Amsterdam,0,0,13342,0,0,0,46907.3,3.51576
+Singapore_71,Singapore,0,0,8281,0,0,0,24843,3
+Amsterdam_GE3T_118,Amsterdam,0,0,687,0,0,0,2415.33,3.51576
