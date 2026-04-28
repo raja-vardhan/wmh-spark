@@ -1,0 +1,18 @@
+{
+  "subject_id": "Amsterdam_GE3T_145",
+  "site": "Amsterdam",
+  "dsc": 0.7296976099300145,
+  "raw_predicted_voxels": 4648,
+  "predicted_voxels": 4291,
+  "reference_voxels": 3282,
+  "intersection": 2763,
+  "lesion_count": 35,
+  "predicted_volume_mm3": 15086.125704659029,
+  "reference_volume_mm3": 11538.723971729418,
+  "voxel_volume_mm3": 3.515759893884649,
+  "max_wmh_probability": 0.9967018986934738,
+  "prediction_threshold": 0.85,
+  "false_positive_voxels": 1528,
+  "false_negative_voxels": 519,
+  "predicted_reference_ratio": 1.3074344911639244
+}

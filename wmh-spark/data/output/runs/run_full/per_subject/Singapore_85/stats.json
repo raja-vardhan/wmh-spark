@@ -1,0 +1,18 @@
+{
+  "subject_id": "Singapore_85",
+  "site": "Singapore",
+  "dsc": 0.7230287859824781,
+  "raw_predicted_voxels": 9667,
+  "predicted_voxels": 9226,
+  "reference_voxels": 6754,
+  "intersection": 5777,
+  "lesion_count": 22,
+  "predicted_volume_mm3": 27677.994238662195,
+  "reference_volume_mm3": 20261.995782346028,
+  "voxel_volume_mm3": 2.9999993755324295,
+  "max_wmh_probability": 0.9953832302718136,
+  "prediction_threshold": 0.85,
+  "false_positive_voxels": 3449,
+  "false_negative_voxels": 977,
+  "predicted_reference_ratio": 1.3660053301747113
+}

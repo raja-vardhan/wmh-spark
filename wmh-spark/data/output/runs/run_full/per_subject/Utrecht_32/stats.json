@@ -1,0 +1,18 @@
+{
+  "subject_id": "Utrecht_32",
+  "site": "Utrecht",
+  "dsc": 0.46079147958650934,
+  "raw_predicted_voxels": 14947,
+  "predicted_voxels": 14142,
+  "reference_voxels": 5012,
+  "intersection": 4413,
+  "lesion_count": 45,
+  "predicted_volume_mm3": 38964.15899285465,
+  "reference_volume_mm3": 13809.10513874894,
+  "voxel_volume_mm3": 2.7552085272843057,
+  "max_wmh_probability": 0.9970251235321129,
+  "prediction_threshold": 0.85,
+  "false_positive_voxels": 9729,
+  "false_negative_voxels": 599,
+  "predicted_reference_ratio": 2.8216280925778134
+}

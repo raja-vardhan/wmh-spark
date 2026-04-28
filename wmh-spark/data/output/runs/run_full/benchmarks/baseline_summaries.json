@@ -1,0 +1,35 @@
+[
+  {
+    "name": "all_zero",
+    "mean_dsc": 0.0,
+    "median_dsc": 0.0,
+    "mean_predicted_reference_ratio": 0.0,
+    "mean_false_positive_voxels": 0.0,
+    "mean_false_negative_voxels": 5733.988888888889,
+    "model_wins": 90,
+    "baseline_wins": 0,
+    "ties": 0
+  },
+  {
+    "name": "all_positive",
+    "mean_dsc": 0.004067564962429359,
+    "median_dsc": 0.0022113320890834957,
+    "mean_predicted_reference_ratio": 1928.6479547446615,
+    "mean_false_positive_voxels": 2801994.3666666667,
+    "mean_false_negative_voxels": 0.0,
+    "model_wins": 90,
+    "baseline_wins": 0,
+    "ties": 0
+  },
+  {
+    "name": "spatial_prior_only",
+    "mean_dsc": 0.06807071296012054,
+    "median_dsc": 0.03778182526773122,
+    "mean_predicted_reference_ratio": 7.089555248070185,
+    "mean_false_positive_voxels": 9675.344444444445,
+    "mean_false_negative_voxels": 5013.5888888888885,
+    "model_wins": 90,
+    "baseline_wins": 0,
+    "ties": 0
+  }
+]

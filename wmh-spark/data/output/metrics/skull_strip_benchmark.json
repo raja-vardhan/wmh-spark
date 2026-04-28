@@ -1,9 +1,9 @@
 {
-  "run_id": "bc1905b0",
-  "total_pairs": 10,
-  "accepted": 10,
+  "run_id": "2ea2a430",
+  "total_pairs": 142,
+  "accepted": 142,
   "rejected": 0,
   "errors": 0,
-  "total_elapsed_seconds": 1048.9957,
-  "subjects_per_hour": 34.32
+  "total_elapsed_seconds": 5714.5102,
+  "subjects_per_hour": 89.46
 }

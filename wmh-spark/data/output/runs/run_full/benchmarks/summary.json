@@ -1,0 +1,75 @@
+{
+  "pipeline_engine": "distributed_sparse",
+  "subject_parallelism": 4,
+  "subjects_train": 60,
+  "subjects_model_train": 48,
+  "subjects_validation": 12,
+  "subjects_test": 90,
+  "mean_dsc": 0.5428116762766446,
+  "total_elapsed_seconds": 9865.96,
+  "feature_set": "rich",
+  "rf_num_trees": 50,
+  "rf_max_depth": 12,
+  "negative_sampling_ratio": 10.0,
+  "min_cluster_size": 10,
+  "min_component_mean_probability": 0.3,
+  "min_component_peak_probability": 0.0,
+  "anatomical_gate_enabled": false,
+  "min_component_mean_spatial_prior": 0.0,
+  "prediction_threshold": 0.85,
+  "candidate_thresholds": [
+    0.35,
+    0.5,
+    0.65,
+    0.75,
+    0.85
+  ],
+  "validation_threshold_selection": {
+    "threshold": 0.85,
+    "dsc": 0.6584624884223526,
+    "predicted_positive": 81771,
+    "reference_positive": 80179,
+    "intersection": 53319
+  },
+  "spatial_prior_baseline_threshold": 0.5,
+  "baseline_summaries": [
+    {
+      "name": "all_zero",
+      "mean_dsc": 0.0,
+      "median_dsc": 0.0,
+      "mean_predicted_reference_ratio": 0.0,
+      "mean_false_positive_voxels": 0.0,
+      "mean_false_negative_voxels": 5733.988888888889,
+      "model_wins": 90,
+      "baseline_wins": 0,
+      "ties": 0
+    },
+    {
+      "name": "all_positive",
+      "mean_dsc": 0.004067564962429359,
+      "median_dsc": 0.0022113320890834957,
+      "mean_predicted_reference_ratio": 1928.6479547446615,
+      "mean_false_positive_voxels": 2801994.3666666667,
+      "mean_false_negative_voxels": 0.0,
+      "model_wins": 90,
+      "baseline_wins": 0,
+      "ties": 0
+    },
+    {
+      "name": "spatial_prior_only",
+      "mean_dsc": 0.06807071296012054,
+      "median_dsc": 0.03778182526773122,
+      "mean_predicted_reference_ratio": 7.089555248070185,
+      "mean_false_positive_voxels": 9675.344444444445,
+      "mean_false_negative_voxels": 5013.5888888888885,
+      "model_wins": 90,
+      "baseline_wins": 0,
+      "ties": 0
+    }
+  ],
+  "class_weighting": true,
+  "positive_class_weight": 77.41251125872552,
+  "positive_class_weight_cap": 100.0,
+  "training_positive_count": 355280,
+  "training_negative_count": 27503117
+}
