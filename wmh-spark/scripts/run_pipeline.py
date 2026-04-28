@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 from contextlib import nullcontext
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 import json
 import logging
@@ -260,7 +261,7 @@ def _parse_args() -> argparse.Namespace:
         "--subject-parallelism",
         type=int,
         default=0,
-        help="Concurrent subject tasks for the distributed sparse pipeline (0 = auto).",
+        help="Concurrent subject tasks for skull-stripping and the distributed sparse pipeline (0 = auto).",
     )
     p.add_argument(
         "--pipeline-engine",
@@ -396,14 +397,18 @@ def _torch_backend_summary() -> str:
     return " ".join(parts)
 
 
+def _slurm_cpus() -> int:
+    """Return SLURM_CPUS_PER_TASK as int, or 0 if unset/invalid."""
+    val = os.environ.get("SLURM_CPUS_PER_TASK", "")
+    return int(val) if val.isdigit() and int(val) > 0 else 0
+
+
 def _resolve_spark_master(args: argparse.Namespace) -> str:
     """Resolve Spark master for local development / single-node Slurm jobs."""
     if args.spark_master:
         return args.spark_master
-    slurm_cpus = os.environ.get("SLURM_CPUS_PER_TASK")
-    if slurm_cpus and slurm_cpus.isdigit() and int(slurm_cpus) > 0:
-        return f"local[{slurm_cpus}]"
-    return "local[4]"
+    cpus = _slurm_cpus()
+    return f"local[{cpus}]" if cpus else "local[4]"
 
 
 def _resolve_subject_parallelism(
@@ -416,6 +421,22 @@ def _resolve_subject_parallelism(
     if args.subject_parallelism > 0:
         return min(args.subject_parallelism, subject_count)
     return max(1, min(subject_count, spark.sparkContext.defaultParallelism))
+
+
+def _resolve_skull_strip_parallelism(
+    args: argparse.Namespace,
+    subject_count: int,
+) -> int:
+    """Resolve worker count for skull-strip parallelism (no Spark needed)."""
+    if subject_count <= 0:
+        return 1
+    explicit = getattr(args, "subject_parallelism", 0)
+    if explicit > 0:
+        return min(explicit, subject_count)
+    cpus = _slurm_cpus()
+    if cpus:
+        return min(cpus, subject_count)
+    return max(1, min(subject_count, 4, os.cpu_count() or 4))
 
 
 def _feature_task_for_record(
@@ -756,14 +777,22 @@ def stage_skull_strip(
     )
     if reused and cached_root is not None:
         logger.info("reused cached skull-strip outputs from: %s", cached_root)
+    max_workers = _resolve_skull_strip_parallelism(args, len(pairs))
+    logger.info("skull-strip parallelism: max_workers=%d subjects=%d", max_workers, len(pairs))
+    if max_workers > 1 and args.hdbet_device != "cpu":
+        logger.warning(
+            "skull-strip: max_workers=%d with device=%s — GPU contention possible; "
+            "set --subject-parallelism 1 if you observe errors",
+            max_workers,
+            args.hdbet_device,
+        )
     results = []
     log_entries = []
     accepted = rejected = error_count = 0
     batch_t0 = time.time()
-    bar = _progress_bar(pairs, args, desc="skull-strip", unit="subject")
-    for pair in bar:
-        bar.set_postfix_str(f"{pair.subject_id} ok={accepted} err={error_count}")
-        result = stripper.process_pair(pair)
+
+    def _accumulate(result: "SkullStrippedOutput") -> None:
+        nonlocal accepted, rejected, error_count
         results.append(result)
         if result.status == "accepted":
             accepted += 1
@@ -771,9 +800,6 @@ def stage_skull_strip(
             rejected += 1
         else:
             error_count += 1
-        bar.set_postfix_str(
-            f"{pair.subject_id} ok={accepted} rejected={rejected} err={error_count}"
-        )
         log_entries.append(
             ProcessingLogEntry(
                 run_id=stripper._run_id,  # same run id used by process_batch logs
@@ -786,6 +812,49 @@ def stage_skull_strip(
                 error_message=result.error_message,
             )
         )
+
+    if max_workers <= 1:
+        bar = _progress_bar(pairs, args, desc="skull-strip", unit="subject")
+        for pair in bar:
+            bar.set_postfix_str(f"{pair.subject_id} ok={accepted} err={error_count}")
+            result = stripper.process_pair(pair)
+            _accumulate(result)
+            bar.set_postfix_str(
+                f"{pair.subject_id} ok={accepted} rejected={rejected} err={error_count}"
+            )
+    else:
+        # Parallel path — submit all pairs to a thread pool; HD-BET releases the GIL
+        # while waiting on its subprocess, so threads give true concurrency here.
+        from wmh_spark.preprocessing.skull_strip import SkullStrippedOutput as _SSO
+
+        with tqdm(
+            total=len(pairs),
+            desc="skull-strip",
+            unit="subject",
+            dynamic_ncols=True,
+            disable=not _progress_enabled(args),
+        ) as bar:
+            future_to_pair = {}
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                for pair in pairs:
+                    future_to_pair[executor.submit(stripper.process_pair, pair)] = pair
+                for future in as_completed(future_to_pair):
+                    pair = future_to_pair[future]
+                    try:
+                        result = future.result()
+                    except Exception as exc:
+                        result = _SSO(
+                            subject_id=pair.subject_id,
+                            status="error",
+                            error_message=f"Unexpected worker error: {exc}",
+                            elapsed_seconds=0.0,
+                        )
+                    _accumulate(result)
+                    bar.update(1)
+                    bar.set_postfix_str(
+                        f"ok={accepted} rejected={rejected} err={error_count}"
+                    )
+
     stripper._write_log(log_entries, batch_elapsed=time.time() - batch_t0)
 
     errors = [r for r in results if r.status != "accepted"]

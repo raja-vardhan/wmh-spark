@@ -1,0 +1,25 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>WMH run — aggregate report</title>
+<style>
+  body { font-family: -apple-system, sans-serif; margin: 24px; max-width: 1100px; }
+  h1 { font-size: 1.5em; }
+  h2 { font-size: 1.1em; margin-top: 24px; }
+  table { border-collapse: collapse; }
+  th, td { border: 1px solid #ccc; padding: 6px 12px; }
+  th { background: #f4f4f4; }
+  .images { display: flex; gap: 16px; flex-wrap: wrap; }
+  .images img { max-height: 360px; border: 1px solid #ddd; }
+</style></head><body>
+<h1>WMH pipeline run — aggregate report</h1>
+<p>Subjects: <b>10</b></p><p>Mean Dice: <b>0.4396</b> (median 0.4417, min 0.0715, max 0.7076)</p><p>Predicted/reference volume ratio: <b>2.2662</b> (median 1.2657)</p>
+<h2>Baseline comparison</h2><table><tr><th>Baseline</th><th>Mean Dice</th><th>Median Dice</th><th>Mean volume ratio</th><th>Mean FP voxels</th><th>Mean FN voxels</th><th>Model wins</th><th>Baseline wins</th><th>Ties</th></tr><tr><td>all_zero</td><td>0.0000</td><td>0.0000</td><td>0.0000</td><td>0</td><td>7216</td><td>10</td><td>0</td><td>0</td></tr><tr><td>all_positive</td><td>0.0051</td><td>0.0031</td><td>2043.3791</td><td>2820560</td><td>0</td><td>10</td><td>0</td><td>0</td></tr><tr><td>spatial_prior_only</td><td>0.0498</td><td>0.0321</td><td>3.1909</td><td>3683</td><td>6809</td><td>10</td><td>0</td><td>0</td></tr></table>
+<h2>Plots</h2>
+<div class="images"><img src='per_site_dsc.png' alt='per_site_dsc.png'><img src='volume_scatter.png' alt='volume_scatter.png'></div>
+<h2>Per-subject results</h2>
+<table>
+  <tr><th>Subject</th><th>Site</th><th>Dice</th><th>Raw voxels</th><th>Lesions</th>
+      <th>Predicted vol (mm³)</th><th>Reference vol (mm³)</th>
+      <th>FP voxels</th><th>FN voxels</th><th>Volume ratio</th></tr>
+  <tr><td><a href='../per_subject/Amsterdam_GE3T_111/report.html'>Amsterdam_GE3T_111</a></td><td>Amsterdam</td><td>0.4602</td><td>16,496</td><td>19</td><td>56,048.2</td><td>22,082.5</td><td>10,828</td><td>1,167</td><td>2.5381</td></tr><tr><td><a href='../per_subject/Singapore_70/report.html'>Singapore_70</a></td><td>Singapore</td><td>0.3222</td><td>8,243</td><td>32</td><td>22,983.0</td><td>7,368.0</td><td>6,031</td><td>826</td><td>3.1193</td></tr><tr><td><a href='../per_subject/Amsterdam_GE3T_117/report.html'>Amsterdam_GE3T_117</a></td><td>Amsterdam</td><td>0.5704</td><td>11,502</td><td>15</td><td>39,489.0</td><td>46,907.3</td><td>4,224</td><td>6,334</td><td>0.8419</td></tr><tr><td><a href='../per_subject/Singapore_71/report.html'>Singapore_71</a></td><td>Singapore</td><td>0.6333</td><td>10,402</td><td>33</td><td>29,628.0</td><td>24,843.0</td><td>4,127</td><td>2,532</td><td>1.1926</td></tr><tr><td><a href='../per_subject/Amsterdam_GE3T_118/report.html'>Amsterdam_GE3T_118</a></td><td>Amsterdam</td><td>0.0715</td><td>7,094</td><td>56</td><td>22,367.3</td><td>2,415.3</td><td>6,110</td><td>435</td><td>9.2606</td></tr><tr><td><a href='../per_subject/Singapore_72/report.html'>Singapore_72</a></td><td>Singapore</td><td>0.7076</td><td>24,215</td><td>17</td><td>71,544.1</td><td>80,511.1</td><td>5,916</td><td>8,905</td><td>0.8886</td></tr><tr><td><a href='../per_subject/Amsterdam_GE3T_119/report.html'>Amsterdam_GE3T_119</a></td><td>Amsterdam</td><td>0.6783</td><td>13,787</td><td>39</td><td>45,606.4</td><td>39,267.5</td><td>4,784</td><td>2,981</td><td>1.1614</td></tr><tr><td><a href='../per_subject/Singapore_73/report.html'>Singapore_73</a></td><td>Singapore</td><td>0.3068</td><td>571</td><td>11</td><td>1,209.0</td><td>903.0</td><td>295</td><td>193</td><td>1.3389</td></tr><tr><td><a href='../per_subject/Amsterdam_GE3T_120/report.html'>Amsterdam_GE3T_120</a></td><td>Amsterdam</td><td>0.2224</td><td>4,249</td><td>63</td><td>11,633.6</td><td>6,296.7</td><td>2,742</td><td>1,224</td><td>1.8476</td></tr><tr><td><a href='../per_subject/Singapore_74/report.html'>Singapore_74</a></td><td>Singapore</td><td>0.4232</td><td>734</td><td>6</td><td>1,449.0</td><td>3,060.0</td><td>165</td><td>702</td><td>0.4735</td></tr>
+</table>
+</body></html>
