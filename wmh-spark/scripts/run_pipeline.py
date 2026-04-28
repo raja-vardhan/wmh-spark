@@ -62,7 +62,12 @@ from wmh_spark.evaluation import (  # noqa: E402
     calculate_dice_result,
     log_subject_benchmark,
 )
-from wmh_spark.feature_extraction import build_feature_dataframe, resolve_feature_columns  # noqa: E402
+from wmh_spark.feature_extraction import (  # noqa: E402
+    SubjectFeatureTask,
+    build_feature_dataframe,
+    build_feature_dataframe_for_tasks,
+    resolve_feature_columns,
+)
 from wmh_spark.io_utils import SubjectRecord, save_volume  # noqa: E402
 from wmh_spark.models import (  # noqa: E402
     ClassificationConfig,
@@ -79,6 +84,7 @@ from wmh_spark.postprocessing import (  # noqa: E402
     filter_components_by_size,
     label_connected_components,
     postprocess_predictions,
+    summarize_subject_predictions,
 )
 from wmh_spark.preprocessing.skull_strip import SkullStripper  # noqa: E402
 from wmh_spark.reporting import (  # noqa: E402
@@ -103,6 +109,16 @@ class ArrangedDataset:
     train_selected: List[SubjectRecord]
     test_selected: List[SubjectRecord]
     manifests_dir: Path
+
+
+@dataclass(frozen=True)
+class DistributedPredictionResult:
+    subject_id: str
+    shape: tuple[int, int, int]
+    positive_xyz: list[tuple[int, int, int]]
+    raw_predicted_voxels: int
+    max_wmh_probability: Optional[float]
+    component_count: int
 
 
 # ---------------------------------------------------------------------------
@@ -241,6 +257,18 @@ def _parse_args() -> argparse.Namespace:
         help="Spark SQL shuffle partitions (default: 8).",
     )
     p.add_argument(
+        "--subject-parallelism",
+        type=int,
+        default=0,
+        help="Concurrent subject tasks for the distributed sparse pipeline (0 = auto).",
+    )
+    p.add_argument(
+        "--pipeline-engine",
+        choices=["legacy", "distributed_sparse"],
+        default="legacy",
+        help="Pipeline execution engine. 'distributed_sparse' enables sparse brain-only subject tasks.",
+    )
+    p.add_argument(
         "--skip-skull-strip",
         action="store_true",
         help="Reuse cached HD-BET outputs under <output-root>/skull_stripped",
@@ -376,6 +404,77 @@ def _resolve_spark_master(args: argparse.Namespace) -> str:
     if slurm_cpus and slurm_cpus.isdigit() and int(slurm_cpus) > 0:
         return f"local[{slurm_cpus}]"
     return "local[4]"
+
+
+def _resolve_subject_parallelism(
+    spark: SparkSession,
+    args: argparse.Namespace,
+    subject_count: int,
+) -> int:
+    if subject_count <= 0:
+        raise ValueError("subject_count must be positive")
+    if args.subject_parallelism > 0:
+        return min(args.subject_parallelism, subject_count)
+    return max(1, min(subject_count, spark.sparkContext.defaultParallelism))
+
+
+def _feature_task_for_record(
+    skull_root: Path,
+    record: SubjectRecord,
+    *,
+    include_mask: bool,
+) -> SubjectFeatureTask:
+    t1_bet, flair_bet, _, prior = _stripped_paths(skull_root, record)
+    return SubjectFeatureTask(
+        subject_id=record.subject_id,
+        t1_path=str(t1_bet),
+        flair_path=str(flair_bet),
+        spatial_prior_path=str(prior),
+        mask_path=record.gt_mask_path if include_mask else None,
+    )
+
+
+def _prediction_mask_from_summary(summary: DistributedPredictionResult) -> np.ndarray:
+    pred = np.zeros(summary.shape, dtype=np.uint8)
+    if summary.positive_xyz:
+        coords = np.asarray(summary.positive_xyz, dtype=np.int32)
+        pred[coords[:, 0], coords[:, 1], coords[:, 2]] = 1
+    return pred
+
+
+def _distributed_prediction_result_for_empty_brain(
+    skull_root: Path,
+    record: SubjectRecord,
+) -> DistributedPredictionResult:
+    """Build an all-negative summary when sparse features emit zero rows for ``record``."""
+    _, flair_bet, _, _ = _stripped_paths(skull_root, record)
+    flair_img = nib.load(str(flair_bet))
+    shape = tuple(int(d) for d in flair_img.shape)
+    return DistributedPredictionResult(
+        subject_id=record.subject_id,
+        shape=shape,
+        positive_xyz=[],
+        raw_predicted_voxels=0,
+        max_wmh_probability=None,
+        component_count=0,
+    )
+
+
+def _log_sparse_subject_row_gaps(
+    df: DataFrame,
+    expected_subject_ids: Iterable[str],
+    context: str,
+) -> None:
+    """Log one line per requested subject that has zero rows in a sparse voxel DataFrame."""
+    count_rows = df.groupBy("subject_id").count().collect()
+    count_map = {str(r["subject_id"]): int(r["count"]) for r in count_rows}
+    for sid in sorted(set(expected_subject_ids)):
+        if count_map.get(sid, 0) == 0:
+            logger.warning(
+                "distributed_sparse: %s subject %s emitted zero sparse brain voxel rows",
+                context,
+                sid,
+            )
 
 
 def resolve_hdbet_device(requested: str) -> str:
@@ -619,9 +718,11 @@ def stage_skull_strip(
         out_t1, out_flair, out_mask = _expected_outputs(skull_root, record)
         out_t1.parent.mkdir(parents=True, exist_ok=True)
         for src, dst in ((cached_t1, out_t1), (cached_flair, out_flair), (cached_mask, out_mask)):
+            if dst.is_symlink() and not dst.exists():
+                dst.unlink()
             if dst.exists():
                 continue
-            dst.symlink_to(src)
+            dst.symlink_to(src.resolve())
         return True
 
     records = train_records + test_records
@@ -804,29 +905,57 @@ def stage_train(
     train_records: List[SubjectRecord],
 ) -> tuple[object, ClassificationConfig, ClassBalanceStats]:
     logger.info("building training feature DataFrames: subjects=%d", len(train_records))
-    feature_dfs: List[DataFrame] = []
-    for r in _progress(train_records, args, desc="train features", unit="subject"):
-        if r.gt_mask_path is None:
-            logger.warning("training subject without GT, skipping: %s", r.subject_id)
-            continue
-        t1_bet, flair_bet, _, prior = _stripped_paths(skull_root, r)
-        df = build_feature_dataframe(
-            spark=spark,
-            subject_id=r.subject_id,
-            t1_path=t1_bet,
-            flair_path=flair_bet,
-            spatial_prior_path=prior,
-            mask_path=r.gt_mask_path,
-        )
-        feature_dfs.append(df)
+    feature_subject_count = 0
+    if args.pipeline_engine == "distributed_sparse":
+        task_records = [r for r in train_records if r.gt_mask_path is not None]
+        skipped = len(train_records) - len(task_records)
+        if skipped:
+            logger.warning("training subjects without GT skipped: %d", skipped)
+        if not task_records:
+            raise RuntimeError("no training subjects with ground truth — cannot train")
+        tasks = [_feature_task_for_record(skull_root, record, include_mask=True) for record in task_records]
+        feature_subject_count = len(tasks)
+        training = build_feature_dataframe_for_tasks(
+            spark,
+            tasks,
+            subject_parallelism=_resolve_subject_parallelism(spark, args, len(tasks)),
+            sparse_brain_only=True,
+            include_shape_columns=True,
+            include_label=True,
+        ).cache()
+        expected_train_ids = {r.subject_id for r in task_records}
+        _log_sparse_subject_row_gaps(training, expected_train_ids, "training")
+        if training.count() == 0:
+            training.unpersist()
+            raise RuntimeError(
+                "distributed_sparse: training produced zero voxel rows (no sparse brain voxels in any "
+                "subject). Check brain masks and stripped volumes."
+            )
+    else:
+        feature_dfs: List[DataFrame] = []
+        for r in _progress(train_records, args, desc="train features", unit="subject"):
+            if r.gt_mask_path is None:
+                logger.warning("training subject without GT, skipping: %s", r.subject_id)
+                continue
+            t1_bet, flair_bet, _, prior = _stripped_paths(skull_root, r)
+            df = build_feature_dataframe(
+                spark=spark,
+                subject_id=r.subject_id,
+                t1_path=t1_bet,
+                flair_path=flair_bet,
+                spatial_prior_path=prior,
+                mask_path=r.gt_mask_path,
+            )
+            feature_dfs.append(df)
 
-    if not feature_dfs:
-        raise RuntimeError("no training subjects with ground truth — cannot train")
+        if not feature_dfs:
+            raise RuntimeError("no training subjects with ground truth — cannot train")
 
-    training = feature_dfs[0]
-    for extra in feature_dfs[1:]:
-        training = training.unionByName(extra)
-    training = training.cache()
+        feature_subject_count = len(feature_dfs)
+        training = feature_dfs[0]
+        for extra in feature_dfs[1:]:
+            training = training.unionByName(extra)
+        training = training.cache()
 
     rf_config = ClassificationConfig(
         feature_columns=resolve_feature_columns(args.feature_set),
@@ -842,11 +971,11 @@ def stage_train(
     balance_stats = calculate_class_balance_stats(training, rf_config)
     logger.info(
         (
-            "training RF: subjects=%d feature_set=%s trees=%d max_depth=%d "
+        "training RF: subjects=%d feature_set=%s trees=%d max_depth=%d "
             "negative_count=%d positive_count=%d positive_weight=%.4f "
             "negative_sampling_ratio=%.3f"
         ),
-        len(feature_dfs),
+        feature_subject_count,
         rf_config.feature_set,
         rf_config.num_trees,
         rf_config.max_depth,
@@ -933,6 +1062,55 @@ def stage_predict_one(
     return flair, pred, affine, gt, dice, raw_predicted_voxels, max_wmh_probability
 
 
+def stage_predict_all_distributed(
+    spark: SparkSession,
+    args: argparse.Namespace,
+    skull_root: Path,
+    records: List[SubjectRecord],
+    model,
+    rf_config: ClassificationConfig,
+    post_config: PostProcessingConfig,
+) -> dict[str, DistributedPredictionResult]:
+    if not records:
+        return {}
+    tasks = [_feature_task_for_record(skull_root, record, include_mask=False) for record in records]
+    features = build_feature_dataframe_for_tasks(
+        spark,
+        tasks,
+        subject_parallelism=_resolve_subject_parallelism(spark, args, len(tasks)),
+        sparse_brain_only=True,
+        include_shape_columns=True,
+        include_label=False,
+    )
+    raw = predict_voxel_mask(model, features, rf_config)
+    summarized = summarize_subject_predictions(raw, post_config).collect()
+    results: dict[str, DistributedPredictionResult] = {}
+    for row in summarized:
+        results[row["subject_id"]] = DistributedPredictionResult(
+            subject_id=row["subject_id"],
+            shape=(int(row["shape_z"]), int(row["shape_y"]), int(row["shape_x"])),
+            positive_xyz=[tuple(coord) for coord in json.loads(row["positive_xyz_json"])],
+            raw_predicted_voxels=int(row["raw_predicted_voxels"]),
+            max_wmh_probability=(
+                float(row["max_wmh_probability"])
+                if row["max_wmh_probability"] is not None
+                else None
+            ),
+            component_count=int(row["component_count"]),
+        )
+    expected_ids = {r.subject_id for r in records}
+    missing = expected_ids - set(results.keys())
+    for sid in sorted(missing):
+        logger.warning(
+            "distributed_sparse: test subject %s emitted zero brain voxels in sparse features; "
+            "using all-zero prediction summary",
+            sid,
+        )
+        record = next(r for r in records if r.subject_id == sid)
+        results[sid] = _distributed_prediction_result_for_empty_brain(skull_root, record)
+    return results
+
+
 def stage_tune_validation(
     spark: SparkSession,
     args: argparse.Namespace,
@@ -946,30 +1124,54 @@ def stage_tune_validation(
         return rf_config, None
 
     logger.info("tuning prediction threshold on validation subjects=%d", len(validation_records))
-    validation_dfs: List[DataFrame] = []
-    for record in _progress(validation_records, args, desc="validation features", unit="subject"):
-        if record.gt_mask_path is None:
-            continue
-        t1_bet, flair_bet, _, prior = _stripped_paths(skull_root, record)
-        validation_dfs.append(
-            build_feature_dataframe(
-                spark=spark,
-                subject_id=record.subject_id,
-                t1_path=t1_bet,
-                flair_path=flair_bet,
-                spatial_prior_path=prior,
-                mask_path=record.gt_mask_path,
+    if args.pipeline_engine == "distributed_sparse":
+        task_records = [record for record in validation_records if record.gt_mask_path is not None]
+        if not task_records:
+            logger.warning("no validation subjects with GT; keeping configured threshold %.3f", rf_config.prediction_threshold)
+            return rf_config, None
+        tasks = [_feature_task_for_record(skull_root, record, include_mask=True) for record in task_records]
+        validation = build_feature_dataframe_for_tasks(
+            spark,
+            tasks,
+            subject_parallelism=_resolve_subject_parallelism(spark, args, len(tasks)),
+            sparse_brain_only=True,
+            include_shape_columns=True,
+            include_label=True,
+        ).cache()
+        validation_task_ids = {t.subject_id for t in tasks}
+        _log_sparse_subject_row_gaps(validation, validation_task_ids, "validation")
+        if validation.count() == 0:
+            logger.warning(
+                "distributed_sparse: validation produced zero voxel rows overall; "
+                "skipping threshold tuning",
             )
-        )
+            validation.unpersist()
+            return rf_config, None
+    else:
+        validation_dfs: List[DataFrame] = []
+        for record in _progress(validation_records, args, desc="validation features", unit="subject"):
+            if record.gt_mask_path is None:
+                continue
+            t1_bet, flair_bet, _, prior = _stripped_paths(skull_root, record)
+            validation_dfs.append(
+                build_feature_dataframe(
+                    spark=spark,
+                    subject_id=record.subject_id,
+                    t1_path=t1_bet,
+                    flair_path=flair_bet,
+                    spatial_prior_path=prior,
+                    mask_path=record.gt_mask_path,
+                )
+            )
 
-    if not validation_dfs:
-        logger.warning("no validation subjects with GT; keeping configured threshold %.3f", rf_config.prediction_threshold)
-        return rf_config, None
+        if not validation_dfs:
+            logger.warning("no validation subjects with GT; keeping configured threshold %.3f", rf_config.prediction_threshold)
+            return rf_config, None
 
-    validation = validation_dfs[0]
-    for extra in validation_dfs[1:]:
-        validation = validation.unionByName(extra)
-    validation = validation.cache()
+        validation = validation_dfs[0]
+        for extra in validation_dfs[1:]:
+            validation = validation.unionByName(extra)
+        validation = validation.cache()
 
     probability_df = append_probability_column(model, validation, rf_config).cache()
     selection = select_prediction_threshold(probability_df, rf_config)
@@ -1227,27 +1429,54 @@ def main() -> int:
                 "spatial_prior_only": [],
             }
             logger.info("running prediction, postprocessing, and reports: subjects=%d", len(test_records))
-
-            for r in _progress(test_records, args, desc="predict/report", unit="subject"):
-                t0 = time.time()
-                (
-                    flair,
-                    pred,
-                    affine,
-                    gt,
-                    dice,
-                    raw_predicted_voxels,
-                    max_wmh_probability,
-                ) = stage_predict_one(
+            distributed_predictions: dict[str, DistributedPredictionResult] = {}
+            if args.pipeline_engine == "distributed_sparse":
+                distributed_predictions = stage_predict_all_distributed(
                     spark,
                     args,
                     skull_root,
-                    r,
+                    test_records,
                     model,
                     rf_config,
                     post_config,
-                    pred_dir,
                 )
+
+            for r in _progress(test_records, args, desc="predict/report", unit="subject"):
+                t0 = time.time()
+                if args.pipeline_engine == "distributed_sparse":
+                    summary = distributed_predictions[r.subject_id]
+                    flair_path = Path(_stripped_paths(skull_root, r)[1])
+                    flair_img = nib.load(str(flair_path))
+                    flair = np.asarray(flair_img.dataobj, dtype=np.float32)
+                    affine = flair_img.affine
+                    pred = _prediction_mask_from_summary(summary)
+                    pred_dir.joinpath(r.subject_id).mkdir(parents=True, exist_ok=True)
+                    save_volume(pred, affine, pred_dir / r.subject_id / "wmh_pred.nii.gz", dtype=np.uint8)
+                    gt = None
+                    if r.gt_mask_path:
+                        gt_img = nib.load(r.gt_mask_path)
+                        gt = (np.asarray(gt_img.dataobj) > 0).astype(np.uint8)
+                    raw_predicted_voxels = summary.raw_predicted_voxels
+                    max_wmh_probability = summary.max_wmh_probability
+                else:
+                    (
+                        flair,
+                        pred,
+                        affine,
+                        gt,
+                        _,
+                        raw_predicted_voxels,
+                        max_wmh_probability,
+                    ) = stage_predict_one(
+                        spark,
+                        args,
+                        skull_root,
+                        r,
+                        model,
+                        rf_config,
+                        post_config,
+                        pred_dir,
+                    )
                 vox_mm3 = voxel_volume_mm3(affine)
                 metrics = _subject_metrics_from_masks(
                     r,
@@ -1301,18 +1530,19 @@ def main() -> int:
                 write_subject_report(metrics, subj_out)
 
                 elapsed = time.time() - t0
-                log_subject_benchmark(
-                    subject_id=r.subject_id,
-                    elapsed_seconds=elapsed,
-                    matlab_baseline_seconds=120.0,
-                    worker_nodes=4,
-                    voxel_count=int(np.prod(flair.shape)),
-                    output_path=bench_dir / "subject_bench.jsonl",
-                )
+                if args.pipeline_engine == "legacy":
+                    log_subject_benchmark(
+                        subject_id=r.subject_id,
+                        elapsed_seconds=elapsed,
+                        matlab_baseline_seconds=120.0,
+                        worker_nodes=4,
+                        voxel_count=int(np.prod(flair.shape)),
+                        output_path=bench_dir / "subject_bench.jsonl",
+                    )
                 logger.info(
                     (
                         "[%s] dsc=%s lesions=%d raw_pred_vox=%d pred_vox=%d "
-                        "max_prob=%s elapsed=%.1fs"
+                        "max_prob=%s elapsed=%.1fs engine=%s"
                     ),
                     r.subject_id,
                     f"{metrics.dsc:.4f}" if metrics.dsc is not None else "n/a",
@@ -1321,6 +1551,7 @@ def main() -> int:
                     metrics.predicted_voxels,
                     f"{max_wmh_probability:.4f}" if max_wmh_probability is not None else "n/a",
                     elapsed,
+                    args.pipeline_engine,
                 )
 
             baseline_summaries = [
@@ -1339,6 +1570,10 @@ def main() -> int:
                 )
 
             summary = {
+                "pipeline_engine": args.pipeline_engine,
+                "subject_parallelism": (
+                    args.subject_parallelism if args.subject_parallelism > 0 else "auto"
+                ),
                 "subjects_train": len(train_records),
                 "subjects_model_train": len(model_train_records if validation_records else train_records),
                 "subjects_validation": len(validation_records),

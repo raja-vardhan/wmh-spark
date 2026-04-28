@@ -30,7 +30,7 @@ metastore_db/
 spark-warehouse/
 
 # Data (large files – use Git LFS or keep out of repo)
-data/
+
 wmh-spark/data/
 *.parquet
 *.jsonl
@@ -51,3 +51,4 @@ Thumbs.db
 # Windows Zone Identifiers (from downloads)
 *:Zone.Identifier
 datasets/kaggle/archive (1).zip
+datasets/*

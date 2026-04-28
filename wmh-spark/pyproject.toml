@@ -23,3 +23,8 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: slow end-to-end tests (datasets, Spark, optional)",
+]
