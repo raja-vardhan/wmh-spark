@@ -26,7 +26,7 @@ from __future__ import annotations
 import argparse
 from contextlib import nullcontext
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import logging
 import os
@@ -62,17 +62,22 @@ from wmh_spark.evaluation import (  # noqa: E402
     calculate_dice_result,
     log_subject_benchmark,
 )
-from wmh_spark.feature_extraction import build_feature_dataframe  # noqa: E402
+from wmh_spark.feature_extraction import build_feature_dataframe, resolve_feature_columns  # noqa: E402
 from wmh_spark.io_utils import SubjectRecord, save_volume  # noqa: E402
 from wmh_spark.models import (  # noqa: E402
     ClassificationConfig,
     ClassBalanceStats,
+    append_probability_column,
     calculate_class_balance_stats,
     predict_voxel_mask,
+    select_prediction_threshold,
     train_random_forest_model,
 )
 from wmh_spark.postprocessing import (  # noqa: E402
     PostProcessingConfig,
+    component_size_map,
+    filter_components_by_size,
+    label_connected_components,
     postprocess_predictions,
 )
 from wmh_spark.preprocessing.skull_strip import SkullStripper  # noqa: E402
@@ -156,10 +161,63 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--min-cluster-size", type=int, default=10)
     p.add_argument("--training-partitions", type=int, default=4)
     p.add_argument(
+        "--feature-set",
+        choices=["baseline", "rich"],
+        default="rich",
+        help="Feature bundle used for RF training and inference.",
+    )
+    p.add_argument(
+        "--negative-sampling-ratio",
+        type=float,
+        default=5.0,
+        help="Keep up to this many negative voxels per positive voxel during training (0 disables).",
+    )
+    p.add_argument(
         "--prediction-threshold",
         type=float,
         default=0.25,
         help="Class-1 RF probability threshold for raw WMH mask generation.",
+    )
+    p.add_argument(
+        "--candidate-thresholds",
+        type=str,
+        default="0.15,0.25,0.35,0.5,0.65",
+        help="Comma-separated candidate thresholds for validation-time threshold tuning.",
+    )
+    p.add_argument(
+        "--validation-fraction",
+        type=float,
+        default=0.2,
+        help="Fraction of selected training subjects reserved for validation tuning (0 disables).",
+    )
+    p.add_argument(
+        "--min-component-mean-probability",
+        type=float,
+        default=0.0,
+        help="Minimum mean WMH probability retained connected components must satisfy.",
+    )
+    p.add_argument(
+        "--min-component-peak-probability",
+        type=float,
+        default=0.0,
+        help="Minimum peak WMH probability retained connected components must satisfy.",
+    )
+    p.add_argument(
+        "--anatomical-gate",
+        action="store_true",
+        help="Require retained components to satisfy a minimum mean spatial-prior score.",
+    )
+    p.add_argument(
+        "--min-component-mean-spatial-prior",
+        type=float,
+        default=0.0,
+        help="Minimum component mean spatial-prior score when --anatomical-gate is enabled.",
+    )
+    p.add_argument(
+        "--spatial-prior-baseline-threshold",
+        type=float,
+        default=0.5,
+        help="Threshold for the spatial-prior-only baseline mask.",
     )
     p.add_argument(
         "--spark-master",
@@ -215,6 +273,10 @@ def _comma_split(s: str) -> List[str]:
     return [t.strip() for t in s.split(",") if t.strip()]
 
 
+def _parse_thresholds(s: str) -> tuple[float, ...]:
+    return tuple(float(token) for token in _comma_split(s))
+
+
 def _progress_enabled(args: argparse.Namespace) -> bool:
     return not args.no_progress and sys.stderr.isatty()
 
@@ -253,6 +315,28 @@ def _progress_context(args: argparse.Namespace):
     if _progress_enabled(args):
         return logging_redirect_tqdm()
     return nullcontext()
+
+
+def _split_train_validation_records(
+    records: List[SubjectRecord],
+    validation_fraction: float,
+    seed: int,
+) -> tuple[List[SubjectRecord], List[SubjectRecord]]:
+    if not 0.0 <= validation_fraction < 1.0:
+        raise ValueError("--validation-fraction must be in [0, 1)")
+    if validation_fraction == 0 or len(records) < 4:
+        return records, []
+
+    ordered = sorted(records, key=lambda record: record.subject_id)
+    rng = np.random.default_rng(seed)
+    indices = np.arange(len(ordered))
+    rng.shuffle(indices)
+    validation_count = max(1, int(round(len(ordered) * validation_fraction)))
+    validation_count = min(validation_count, len(ordered) - 1)
+    validation_index_set = set(indices[:validation_count].tolist())
+    train_split = [record for idx, record in enumerate(ordered) if idx not in validation_index_set]
+    validation_split = [record for idx, record in enumerate(ordered) if idx in validation_index_set]
+    return train_split, validation_split
 
 
 def _scanner_label(record: SubjectRecord) -> str:
@@ -493,8 +577,9 @@ def stage_skull_strip(
     test_records: List[SubjectRecord],
 ) -> Path:
     skull_root = args.output_root / "skull_stripped"
+    cached_root = args.skull_strip_root
     if args.skip_skull_strip:
-        cached_root = args.skull_strip_root or skull_root
+        cached_root = cached_root or skull_root
         if cached_root.exists():
             logger.info("--skip-skull-strip: reusing %s", cached_root)
             return cached_root
@@ -512,24 +597,64 @@ def stage_skull_strip(
     )
     from wmh_spark.preprocessing.skull_strip import ProcessingLogEntry, RawScan, ScanPair
 
-    pairs = []
-    for r in _progress(train_records + test_records, args, desc="build skull-strip queue", unit="subject"):
+    def _expected_outputs(root: Path, record: SubjectRecord) -> tuple[Path, Path, Path]:
+        subj = root / record.subject_id
+        t1_stem = Path(record.t1_path).name.split(".nii")[0]
+        flair_stem = Path(record.flair_path).name.split(".nii")[0]
+        return (
+            subj / f"{t1_stem}_bet.nii.gz",
+            subj / f"{flair_stem}_bet.nii.gz",
+            subj / f"{flair_stem}_bet_mask.nii.gz",
+        )
+
+    def _link_cached_outputs(record: SubjectRecord) -> bool:
+        if cached_root is None:
+            return False
+        if not cached_root.exists():
+            return False
+        cached_t1, cached_flair, cached_mask = _expected_outputs(cached_root, record)
+        if not (cached_t1.exists() and cached_flair.exists() and cached_mask.exists()):
+            return False
+
+        out_t1, out_flair, out_mask = _expected_outputs(skull_root, record)
+        out_t1.parent.mkdir(parents=True, exist_ok=True)
+        for src, dst in ((cached_t1, out_t1), (cached_flair, out_flair), (cached_mask, out_mask)):
+            if dst.exists():
+                continue
+            dst.symlink_to(src)
+        return True
+
+    records = train_records + test_records
+    pairs: list[ScanPair] = []
+    reused = 0
+    for record in _progress(records, args, desc="build skull-strip queue", unit="subject"):
+        out_t1, out_flair, out_mask = _expected_outputs(skull_root, record)
+        if out_t1.exists() and out_flair.exists() and out_mask.exists():
+            reused += 1
+            continue
+        if _link_cached_outputs(record):
+            reused += 1
+            continue
         pairs.append(
             ScanPair(
-                subject_id=r.subject_id,
-                t1_scan=RawScan(path=Path(r.t1_path), modality="T1", subject_id=r.subject_id),
+                subject_id=record.subject_id,
+                t1_scan=RawScan(path=Path(record.t1_path), modality="T1", subject_id=record.subject_id),
                 flair_scan=RawScan(
-                    path=Path(r.flair_path), modality="FLAIR", subject_id=r.subject_id
+                    path=Path(record.flair_path), modality="FLAIR", subject_id=record.subject_id
                 ),
             )
         )
 
     logger.info(
-        "starting skull-strip: subjects=%d device=%s enable_tta=%s",
+        "starting skull-strip: total=%d reused=%d to_run=%d device=%s enable_tta=%s",
+        len(records),
+        reused,
         len(pairs),
         args.hdbet_device,
         args.enable_tta,
     )
+    if reused and cached_root is not None:
+        logger.info("reused cached skull-strip outputs from: %s", cached_root)
     results = []
     log_entries = []
     accepted = rejected = error_count = 0
@@ -582,26 +707,71 @@ def _stripped_paths(skull_root: Path, record: SubjectRecord) -> tuple[Path, Path
     )
 
 
+def _build_training_spatial_prior(prior_records: List[SubjectRecord]) -> tuple[np.ndarray, np.ndarray]:
+    """Build a smoothed lesion-frequency prior from training WMH masks."""
+    from scipy import ndimage
+    from nibabel.processing import resample_from_to
+
+    raise RuntimeError(
+        "_build_training_spatial_prior is no longer used; "
+        "subject-specific priors should be built with _build_subject_spatial_prior"
+    )
+
+
+def _build_subject_spatial_prior(
+    prior_records: List[SubjectRecord],
+    target_shape: tuple[int, int, int],
+    target_affine: np.ndarray,
+) -> np.ndarray:
+    """Build a smoothed lesion-frequency prior on one target subject grid."""
+    from scipy import ndimage
+    from nibabel.processing import resample_from_to
+
+    priors: List[np.ndarray] = []
+
+    for record in prior_records:
+        if record.gt_mask_path is None:
+            continue
+        mask_img = nib.load(record.gt_mask_path)
+        mask_data = (np.asarray(mask_img.dataobj) > 0).astype(np.float32)
+        mask_binary_img = nib.Nifti1Image(mask_data, mask_img.affine)
+        resampled = resample_from_to(
+            mask_binary_img,
+            (target_shape, target_affine),
+            order=0,
+        )
+        priors.append(np.asarray(resampled.dataobj, dtype=np.float32))
+
+    if not priors:
+        raise RuntimeError("cannot build spatial prior without at least one training GT mask")
+
+    prior = np.mean(np.stack(priors, axis=0), axis=0).astype(np.float32)
+    prior = ndimage.gaussian_filter(prior, sigma=1.0).astype(np.float32)
+    max_value = float(prior.max())
+    if max_value > 0:
+        prior /= max_value
+    return prior
+
+
 def stage_spatial_prior(
     args: argparse.Namespace,
     skull_root: Path,
-    records: List[SubjectRecord],
+    prior_records: List[SubjectRecord],
+    target_records: List[SubjectRecord],
 ) -> None:
     """Generate per-subject spatial prior + binarised GT mask.
 
-    - spatial_prior.nii.gz = copy of FLAIR brain mask (HD-BET output)
+    - spatial_prior.nii.gz = smoothed lesion-frequency prior built from training GT masks
     - wmh_binary.nii.gz = GT mask with non-{0,1} labels coerced to 0
       (WMH-2017 uses label 2 for "other pathology" which is excluded by
        challenge convention). Records without GT keep gt_mask_path=None.
     """
-    logger.info("preparing spatial priors and binary GT masks: subjects=%d", len(records))
-    for r in _progress(records, args, desc="prepare masks", unit="subject"):
-        _, _, flair_mask, prior = _stripped_paths(skull_root, r)
-        if not flair_mask.exists():
-            raise FileNotFoundError(f"FLAIR brain mask missing: {flair_mask}")
-        if not prior.exists():
-            shutil.copyfile(flair_mask, prior)
-
+    logger.info(
+        "preparing spatial priors and binary GT masks: prior_subjects=%d target_subjects=%d",
+        len(prior_records),
+        len(target_records),
+    )
+    for r in _progress(target_records, args, desc="prepare masks", unit="subject"):
         if r.gt_mask_path is None:
             continue
         binary_path = skull_root / r.subject_id / "wmh_binary.nii.gz"
@@ -611,6 +781,20 @@ def stage_spatial_prior(
             binary = (arr == 1).astype(np.uint8)
             save_volume(binary, img.affine, binary_path, dtype=np.uint8)
         r.gt_mask_path = str(binary_path)
+
+    for r in _progress(target_records, args, desc="write priors", unit="subject"):
+        _, flair_bet, _, prior_path = _stripped_paths(skull_root, r)
+        if not flair_bet.exists():
+            raise FileNotFoundError(f"FLAIR brain volume missing: {flair_bet}")
+        flair_img = nib.load(str(flair_bet))
+        target_shape = tuple(int(dim) for dim in flair_img.shape)
+        target_affine = flair_img.affine
+        prior = _build_subject_spatial_prior(
+            prior_records,
+            target_shape=target_shape,
+            target_affine=target_affine,
+        )
+        save_volume(prior, target_affine, prior_path)
 
 
 def stage_train(
@@ -645,26 +829,33 @@ def stage_train(
     training = training.cache()
 
     rf_config = ClassificationConfig(
+        feature_columns=resolve_feature_columns(args.feature_set),
+        feature_set=args.feature_set,
         num_trees=args.num_trees,
         max_depth=args.max_depth,
         training_partitions=args.training_partitions,
         seed=args.seed,
         prediction_threshold=args.prediction_threshold,
+        negative_sampling_ratio=args.negative_sampling_ratio,
+        candidate_thresholds=_parse_thresholds(args.candidate_thresholds),
     )
     balance_stats = calculate_class_balance_stats(training, rf_config)
     logger.info(
         (
-            "training RF: subjects=%d trees=%d max_depth=%d "
-            "negative_count=%d positive_count=%d positive_weight=%.4f"
+            "training RF: subjects=%d feature_set=%s trees=%d max_depth=%d "
+            "negative_count=%d positive_count=%d positive_weight=%.4f "
+            "negative_sampling_ratio=%.3f"
         ),
         len(feature_dfs),
+        rf_config.feature_set,
         rf_config.num_trees,
         rf_config.max_depth,
         balance_stats.negative_count,
         balance_stats.positive_count,
         balance_stats.positive_class_weight,
+        rf_config.negative_sampling_ratio,
     )
-    model = train_random_forest_model(training, rf_config, balance_stats=balance_stats)
+    model = train_random_forest_model(training, rf_config)
     return model, rf_config, balance_stats
 
 
@@ -675,6 +866,7 @@ def stage_predict_one(
     record: SubjectRecord,
     model,
     rf_config: ClassificationConfig,
+    post_config: PostProcessingConfig,
     pred_dir: Path,
 ):
     """Run inference + postprocess for one subject.
@@ -709,13 +901,7 @@ def stage_predict_one(
     flair = np.asarray(flair_img.dataobj, dtype=np.float32)
     affine = flair_img.affine
 
-    post = postprocess_predictions(
-        raw,
-        PostProcessingConfig(
-            volume_shape=flair.shape,
-            min_cluster_size=args.min_cluster_size,
-        ),
-    )
+    post = postprocess_predictions(raw, replace(post_config, volume_shape=flair.shape))
 
     rows = (
         post.select("z", "y", "x", "postprocessed_mask").where("postprocessed_mask = 1").collect()
@@ -747,6 +933,170 @@ def stage_predict_one(
     return flair, pred, affine, gt, dice, raw_predicted_voxels, max_wmh_probability
 
 
+def stage_tune_validation(
+    spark: SparkSession,
+    args: argparse.Namespace,
+    skull_root: Path,
+    validation_records: List[SubjectRecord],
+    model,
+    rf_config: ClassificationConfig,
+) -> tuple[ClassificationConfig, Optional[dict]]:
+    """Tune the RF probability threshold on held-out validation subjects."""
+    if not validation_records:
+        return rf_config, None
+
+    logger.info("tuning prediction threshold on validation subjects=%d", len(validation_records))
+    validation_dfs: List[DataFrame] = []
+    for record in _progress(validation_records, args, desc="validation features", unit="subject"):
+        if record.gt_mask_path is None:
+            continue
+        t1_bet, flair_bet, _, prior = _stripped_paths(skull_root, record)
+        validation_dfs.append(
+            build_feature_dataframe(
+                spark=spark,
+                subject_id=record.subject_id,
+                t1_path=t1_bet,
+                flair_path=flair_bet,
+                spatial_prior_path=prior,
+                mask_path=record.gt_mask_path,
+            )
+        )
+
+    if not validation_dfs:
+        logger.warning("no validation subjects with GT; keeping configured threshold %.3f", rf_config.prediction_threshold)
+        return rf_config, None
+
+    validation = validation_dfs[0]
+    for extra in validation_dfs[1:]:
+        validation = validation.unionByName(extra)
+    validation = validation.cache()
+
+    probability_df = append_probability_column(model, validation, rf_config).cache()
+    selection = select_prediction_threshold(probability_df, rf_config)
+    probability_df.unpersist()
+    validation.unpersist()
+
+    tuned = replace(rf_config, prediction_threshold=selection.threshold)
+    logger.info(
+        "selected validation threshold=%.3f dsc=%.4f predicted_positive=%d reference_positive=%d",
+        selection.threshold,
+        selection.dsc,
+        selection.predicted_positive,
+        selection.reference_positive,
+    )
+    return tuned, selection.to_dict()
+
+
+def _dice_from_masks(prediction: np.ndarray, ground_truth: np.ndarray) -> Optional[float]:
+    predicted_positive = int(prediction.sum())
+    reference_positive = int(ground_truth.sum())
+    denominator = predicted_positive + reference_positive
+    if denominator == 0:
+        return None
+    intersection = int(np.logical_and(prediction != 0, ground_truth != 0).sum())
+    return (2.0 * intersection) / denominator
+
+
+def _subject_metrics_from_masks(
+    record: SubjectRecord,
+    prediction: np.ndarray,
+    ground_truth: Optional[np.ndarray],
+    voxel_volume: float,
+    raw_predicted_voxels: Optional[int] = None,
+    max_wmh_probability: Optional[float] = None,
+    prediction_threshold: Optional[float] = None,
+) -> SubjectMetrics:
+    predicted_voxels = int(prediction.sum())
+    predicted_volume = predicted_voxels * voxel_volume
+    lesion_count = count_lesions(prediction)
+    reference_voxels = int(ground_truth.sum()) if ground_truth is not None else None
+    reference_volume = reference_voxels * voxel_volume if reference_voxels is not None else None
+    false_positive_voxels = None
+    false_negative_voxels = None
+    predicted_reference_ratio = None
+    dsc = None
+    intersection = None
+
+    if ground_truth is not None:
+        false_positive_voxels = int(np.logical_and(prediction != 0, ground_truth == 0).sum())
+        false_negative_voxels = int(np.logical_and(prediction == 0, ground_truth != 0).sum())
+        intersection = int(np.logical_and(prediction != 0, ground_truth != 0).sum())
+        dsc = _dice_from_masks(prediction, ground_truth)
+        if reference_volume and reference_volume > 0:
+            predicted_reference_ratio = predicted_volume / reference_volume
+
+    return SubjectMetrics(
+        subject_id=record.subject_id,
+        site=record.site,
+        dsc=dsc,
+        predicted_voxels=predicted_voxels,
+        reference_voxels=reference_voxels,
+        intersection=intersection,
+        lesion_count=lesion_count,
+        predicted_volume_mm3=predicted_volume,
+        reference_volume_mm3=reference_volume,
+        voxel_volume_mm3=voxel_volume,
+        raw_predicted_voxels=raw_predicted_voxels,
+        max_wmh_probability=max_wmh_probability,
+        prediction_threshold=prediction_threshold,
+        false_positive_voxels=false_positive_voxels,
+        false_negative_voxels=false_negative_voxels,
+        predicted_reference_ratio=predicted_reference_ratio,
+    )
+
+
+def _build_spatial_prior_baseline(
+    prior_path: Path,
+    shape: tuple[int, int, int],
+    threshold: float,
+    min_cluster_size: int,
+) -> np.ndarray:
+    prior_img = nib.load(str(prior_path))
+    prior = np.asarray(prior_img.dataobj, dtype=np.float32)
+    if prior.shape != shape:
+        raise ValueError(f"spatial prior shape {prior.shape} != target shape {shape}")
+    baseline = (prior >= threshold).astype(np.uint8)
+    labeled, _ = label_connected_components(baseline)
+    sizes = component_size_map(labeled)
+    return filter_components_by_size(labeled, sizes, min_cluster_size)
+
+
+def _summarize_metrics(name: str, metrics: List[SubjectMetrics], reference: Optional[List[SubjectMetrics]] = None) -> dict:
+    dsc_values = [metric.dsc for metric in metrics if metric.dsc is not None]
+    ratio_values = [
+        metric.predicted_reference_ratio
+        for metric in metrics
+        if metric.predicted_reference_ratio is not None
+    ]
+    fp_values = [metric.false_positive_voxels for metric in metrics if metric.false_positive_voxels is not None]
+    fn_values = [metric.false_negative_voxels for metric in metrics if metric.false_negative_voxels is not None]
+    summary = {
+        "name": name,
+        "mean_dsc": float(np.mean(dsc_values)) if dsc_values else None,
+        "median_dsc": float(np.median(dsc_values)) if dsc_values else None,
+        "mean_predicted_reference_ratio": float(np.mean(ratio_values)) if ratio_values else None,
+        "mean_false_positive_voxels": float(np.mean(fp_values)) if fp_values else None,
+        "mean_false_negative_voxels": float(np.mean(fn_values)) if fn_values else None,
+    }
+    if reference is not None:
+        reference_by_subject = {metric.subject_id: metric for metric in reference}
+        model_wins = baseline_wins = ties = 0
+        for metric in metrics:
+            ref_metric = reference_by_subject.get(metric.subject_id)
+            if ref_metric is None or metric.dsc is None or ref_metric.dsc is None:
+                continue
+            if ref_metric.dsc > metric.dsc:
+                model_wins += 1
+            elif metric.dsc > ref_metric.dsc:
+                baseline_wins += 1
+            else:
+                ties += 1
+        summary["model_wins"] = model_wins
+        summary["baseline_wins"] = baseline_wins
+        summary["ties"] = ties
+    return summary
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -757,6 +1107,9 @@ def main() -> int:
     args = _parse_args()
     if not 0.0 <= args.prediction_threshold <= 1.0:
         raise ValueError("--prediction-threshold must be between 0 and 1")
+    if not 0.0 <= args.spatial_prior_baseline_threshold <= 1.0:
+        raise ValueError("--spatial-prior-baseline-threshold must be between 0 and 1")
+    _parse_thresholds(args.candidate_thresholds)
 
     t_start = time.time()
 
@@ -778,13 +1131,31 @@ def main() -> int:
 
         train_records = arranged.train_selected
         test_records = arranged.test_selected
+        model_train_records, validation_records = _split_train_validation_records(
+            train_records,
+            args.validation_fraction,
+            args.seed,
+        )
+        logger.info(
+            "subject split: model_train=%d validation=%d test=%d",
+            len(model_train_records),
+            len(validation_records),
+            len(test_records),
+        )
 
         args.output_root.mkdir(parents=True, exist_ok=True)
         write_manifest(train_records, arranged.manifests_dir / "train_manifest.parquet")
+        if validation_records:
+            write_manifest(validation_records, arranged.manifests_dir / "validation_manifest.parquet")
         write_manifest(test_records, arranged.manifests_dir / "test_manifest.parquet")
 
         skull_root = stage_skull_strip(args, train_records, test_records)
-        stage_spatial_prior(args, skull_root, train_records + test_records)
+        stage_spatial_prior(
+            args,
+            skull_root,
+            model_train_records if validation_records else train_records,
+            train_records + test_records,
+        )
 
         spark_master = _resolve_spark_master(args)
         logger.info(
@@ -803,7 +1174,40 @@ def main() -> int:
         spark.sparkContext.setLogLevel("WARN")
 
         try:
-            model, rf_config, balance_stats = stage_train(spark, args, skull_root, train_records)
+            model, rf_config, balance_stats = stage_train(
+                spark,
+                args,
+                skull_root,
+                model_train_records if validation_records else train_records,
+            )
+            rf_config, validation_summary = stage_tune_validation(
+                spark,
+                args,
+                skull_root,
+                validation_records,
+                model,
+                rf_config,
+            )
+
+            if validation_records:
+                stage_spatial_prior(args, skull_root, train_records, train_records + test_records)
+                model, retrained_config, balance_stats = stage_train(
+                    spark,
+                    args,
+                    skull_root,
+                    train_records,
+                )
+                rf_config = replace(retrained_config, prediction_threshold=rf_config.prediction_threshold)
+            else:
+                validation_summary = None
+
+            post_config = PostProcessingConfig(
+                min_cluster_size=args.min_cluster_size,
+                min_component_mean_probability=args.min_component_mean_probability,
+                min_component_peak_probability=args.min_component_peak_probability,
+                anatomical_gate_enabled=args.anatomical_gate,
+                min_component_mean_spatial_prior=args.min_component_mean_spatial_prior,
+            )
 
             model_dir = args.output_root / "model"
             if model_dir.exists():
@@ -817,6 +1221,11 @@ def main() -> int:
             bench_dir.mkdir(parents=True, exist_ok=True)
 
             all_metrics: List[SubjectMetrics] = []
+            baseline_metrics: dict[str, List[SubjectMetrics]] = {
+                "all_zero": [],
+                "all_positive": [],
+                "spatial_prior_only": [],
+            }
             logger.info("running prediction, postprocessing, and reports: subjects=%d", len(test_records))
 
             for r in _progress(test_records, args, desc="predict/report", unit="subject"):
@@ -830,32 +1239,57 @@ def main() -> int:
                     raw_predicted_voxels,
                     max_wmh_probability,
                 ) = stage_predict_one(
-                    spark, args, skull_root, r, model, rf_config, pred_dir
+                    spark,
+                    args,
+                    skull_root,
+                    r,
+                    model,
+                    rf_config,
+                    post_config,
+                    pred_dir,
                 )
                 vox_mm3 = voxel_volume_mm3(affine)
-
-                lesion_count = count_lesions(pred)
-                predicted_voxels = int(pred.sum())
-                predicted_volume = predicted_voxels * vox_mm3
-                reference_voxels = int(gt.sum()) if gt is not None else None
-                reference_volume = reference_voxels * vox_mm3 if reference_voxels is not None else None
-
-                metrics = SubjectMetrics(
-                    subject_id=r.subject_id,
-                    site=r.site,
-                    dsc=dice.dsc if dice else None,
-                    predicted_voxels=predicted_voxels,
-                    reference_voxels=reference_voxels,
-                    intersection=dice.intersection if dice else None,
-                    lesion_count=lesion_count,
-                    predicted_volume_mm3=predicted_volume,
-                    reference_volume_mm3=reference_volume,
-                    voxel_volume_mm3=vox_mm3,
+                metrics = _subject_metrics_from_masks(
+                    r,
+                    pred,
+                    gt,
+                    vox_mm3,
                     raw_predicted_voxels=raw_predicted_voxels,
                     max_wmh_probability=max_wmh_probability,
                     prediction_threshold=rf_config.prediction_threshold,
                 )
                 all_metrics.append(metrics)
+
+                baseline_metrics["all_zero"].append(
+                    _subject_metrics_from_masks(
+                        r,
+                        np.zeros(flair.shape, dtype=np.uint8),
+                        gt,
+                        vox_mm3,
+                    )
+                )
+                baseline_metrics["all_positive"].append(
+                    _subject_metrics_from_masks(
+                        r,
+                        np.ones(flair.shape, dtype=np.uint8),
+                        gt,
+                        vox_mm3,
+                    )
+                )
+                baseline_metrics["spatial_prior_only"].append(
+                    _subject_metrics_from_masks(
+                        r,
+                        _build_spatial_prior_baseline(
+                            _stripped_paths(skull_root, r)[3],
+                            flair.shape,
+                            args.spatial_prior_baseline_threshold,
+                            args.min_cluster_size,
+                        ),
+                        gt,
+                        vox_mm3,
+                        prediction_threshold=args.spatial_prior_baseline_threshold,
+                    )
+                )
 
                 subj_out = per_subject_dir / r.subject_id
                 render_subject_overlay(
@@ -881,28 +1315,52 @@ def main() -> int:
                         "max_prob=%s elapsed=%.1fs"
                     ),
                     r.subject_id,
-                    f"{dice.dsc:.4f}" if dice else "n/a",
-                    lesion_count,
+                    f"{metrics.dsc:.4f}" if metrics.dsc is not None else "n/a",
+                    metrics.lesion_count,
                     raw_predicted_voxels,
-                    predicted_voxels,
+                    metrics.predicted_voxels,
                     f"{max_wmh_probability:.4f}" if max_wmh_probability is not None else "n/a",
                     elapsed,
                 )
 
+            baseline_summaries = [
+                _summarize_metrics(name, metric_list, reference=all_metrics)
+                for name, metric_list in baseline_metrics.items()
+            ]
+            (bench_dir / "baseline_summaries.json").write_text(
+                json.dumps(baseline_summaries, indent=2)
+            )
+
             for _ in _progress([None], args, desc="aggregate report", unit="stage"):
-                write_aggregate_report(all_metrics, args.output_root / "aggregate")
+                write_aggregate_report(
+                    all_metrics,
+                    args.output_root / "aggregate",
+                    baseline_summaries=baseline_summaries,
+                )
 
             summary = {
                 "subjects_train": len(train_records),
+                "subjects_model_train": len(model_train_records if validation_records else train_records),
+                "subjects_validation": len(validation_records),
                 "subjects_test": len(test_records),
                 "mean_dsc": float(np.mean([m.dsc for m in all_metrics if m.dsc is not None]))
                 if any(m.dsc is not None for m in all_metrics)
                 else None,
                 "total_elapsed_seconds": round(time.time() - t_start, 2),
+                "feature_set": rf_config.feature_set,
                 "rf_num_trees": rf_config.num_trees,
                 "rf_max_depth": rf_config.max_depth,
+                "negative_sampling_ratio": rf_config.negative_sampling_ratio,
                 "min_cluster_size": args.min_cluster_size,
+                "min_component_mean_probability": args.min_component_mean_probability,
+                "min_component_peak_probability": args.min_component_peak_probability,
+                "anatomical_gate_enabled": args.anatomical_gate,
+                "min_component_mean_spatial_prior": args.min_component_mean_spatial_prior,
                 "prediction_threshold": rf_config.prediction_threshold,
+                "candidate_thresholds": list(rf_config.candidate_thresholds),
+                "validation_threshold_selection": validation_summary,
+                "spatial_prior_baseline_threshold": args.spatial_prior_baseline_threshold,
+                "baseline_summaries": baseline_summaries,
                 "class_weighting": True,
                 "positive_class_weight": balance_stats.positive_class_weight,
                 "positive_class_weight_cap": rf_config.positive_class_weight_cap,
